@@ -12,10 +12,18 @@ const OFFSCREEN_PATH = 'offscreen.html';
 // startup window (picker + countdown), startedAt stays 0.
 let state = { startedAt: 0, tabId: null, windowId: null, tabTitle: '', mics: [], uiTabs: [] };
 
-// Restore on cold start. Only apply if in-memory state is still pristine —
-// otherwise a click handler already mutated state and a late restore would
-// clobber it.
-chrome.storage.session.get('state').then((s) => {
+// On cold start, the offscreen doc keeps the SW alive while recording, so if
+// the SW just woke up and NO offscreen doc exists, no recording can be in
+// flight — any persisted state is stale (e.g. from a crashed prior session).
+// Wipe it so the next click takes the start path, not the stale toggle-stop
+// branch (which silently no-ops when offscreen.phase is 'idle').
+chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }).then(async (ctxs) => {
+  if (ctxs.length === 0) {
+    await chrome.storage.session.remove('state').catch(() => {});
+    return;
+  }
+  // Offscreen doc exists — restore state only if our in-memory copy is pristine.
+  const s = await chrome.storage.session.get('state');
   if (!s.state) return;
   const pristine = state.startedAt === 0 && state.tabId === null &&
     (!state.uiTabs || state.uiTabs.length === 0) &&
@@ -127,13 +135,18 @@ function sanitizeFilename(title) {
 chrome.action.onClicked.addListener(async (tab) => {
   console.log('[QR sw] action.onClicked tab=', tab.id, 'url=', tab.url);
 
-  // If a recording is in progress, click toggles stop. Send and return.
+  // If a recording is in progress, click toggles stop. But verify offscreen
+  // doc actually exists — otherwise startedAt is stale (from a previously
+  // crashed/aborted session) and we should fall through to start fresh.
   if (state.startedAt > 0) {
-    await ensureOffscreen();
-    chrome.runtime
-      .sendMessage({ target: 'offscreen', type: 'toggle' })
-      .catch((e) => { console.warn('[QR sw] toggle stop failed', e); resetState(); });
-    return;
+    if (await hasOffscreen()) {
+      chrome.runtime
+        .sendMessage({ target: 'offscreen', type: 'toggle' })
+        .catch((e) => { console.warn('[QR sw] toggle stop failed', e); resetState(); });
+      return;
+    }
+    console.log('[QR sw] stale startedAt with no offscreen doc — resetting and starting fresh');
+    resetState();
   }
 
   // Block restricted URLs — tabCapture and content scripts both fail on them.
