@@ -167,7 +167,10 @@
       width: 100% !important; height: 100% !important;
       object-fit: cover !important;
       display: block !important;
+      /* Mirror + light "vibrant natural" filter: subtle saturation/contrast lift
+         so the MacBook camera looks less dull. Always on. */
       transform: scaleX(-1) !important;
+      filter: saturate(1.18) contrast(1.06) brightness(1.04) !important;
       pointer-events: none !important;
     }
     .qr-cam-resize {
@@ -178,6 +181,56 @@
       background:
         linear-gradient(135deg, transparent 50%, rgba(255,255,255,0.55) 50%, rgba(255,255,255,0.55) 60%,
         transparent 60%, transparent 70%, rgba(255,255,255,0.55) 70%, rgba(255,255,255,0.55) 80%, transparent 80%);
+    }
+
+    /* ── Post-record popup ─────────────────────────────────────────────── */
+    .qr-postrec {
+      position: absolute;
+      left: 16px; bottom: 16px;
+      pointer-events: auto !important;
+      background: rgba(20,20,22,0.96) !important;
+      color: white !important;
+      border-radius: 14px !important;
+      padding: 14px 16px !important;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.55);
+      min-width: 280px;
+      display: flex; flex-direction: column; gap: 10px;
+      animation: qr-slide-up 200ms ease-out;
+    }
+    @keyframes qr-slide-up {
+      from { transform: translateY(12px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    .qr-postrec-title { font-size: 13px !important; font-weight: 600 !important; }
+    .qr-postrec-sub { font-size: 12px !important; color: rgba(255,255,255,0.65) !important; }
+    .qr-postrec-buttons { display: flex; gap: 8px; margin-top: 4px; }
+    .qr-postrec-btn {
+      flex: 1;
+      padding: 8px 14px !important;
+      border-radius: 8px !important;
+      border: none !important;
+      cursor: pointer !important;
+      font-size: 13px !important;
+      font-weight: 600 !important;
+      color: white !important;
+      transition: background 120ms;
+    }
+    .qr-postrec-btn.primary { background: #2563eb !important; }
+    .qr-postrec-btn.primary:hover { background: #1d4ed8 !important; }
+    .qr-postrec-btn.secondary { background: rgba(255,255,255,0.12) !important; }
+    .qr-postrec-btn.secondary:hover { background: rgba(255,255,255,0.22) !important; }
+    .qr-postrec-progress {
+      height: 3px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .qr-postrec-progress-fill {
+      height: 100%;
+      background: #2563eb;
+      width: 100%;
+      transform-origin: left center;
+      transition: transform 200ms linear;
     }
   `;
 
@@ -338,14 +391,23 @@
     if (camVideo) camVideo.srcObject = null;
   }
 
+  // Same priority logic as offscreen.js — keep both in sync.
+  function micPriorityRank(label) {
+    const l = (label || '').toLowerCase();
+    if (/usb/.test(l)) return 0;
+    if (/airpod|bluetooth|wireless|headphone|headset|earbud/.test(l)) return 1;
+    if (/built-?in|macbook|internal|default/.test(l)) return 3;
+    return 2;
+  }
   async function refreshDevices() {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       cams = devices.filter((d) => d.kind === 'videoinput')
         .map((d) => ({ id: d.deviceId, label: d.label || 'Camera' }));
       const newMics = devices.filter((d) => d.kind === 'audioinput')
+        .filter((d) => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications')
         .map((d) => ({ id: d.deviceId, label: d.label || 'Microphone' }));
-      // Keep server-side mics list authoritative if richer (offscreen has labels).
+      newMics.sort((a, b) => micPriorityRank(a.label) - micPriorityRank(b.label));
       if (newMics.length && newMics[0].label) mics = newMics;
     } catch {}
   }
@@ -599,13 +661,83 @@
     startTimer(msg.startedAt || Date.now());
   }
 
+  // ── Post-record popup ─────────────────────────────────────────────────────
+  let postrecEl = null;
+  let postrecTimer = null;
+
+  function dismissPostRec() {
+    if (postrecTimer) { clearTimeout(postrecTimer); postrecTimer = null; }
+    if (postrecEl && postrecEl.parentNode) postrecEl.parentNode.removeChild(postrecEl);
+    postrecEl = null;
+  }
+
+  function showPostRecord(recordingId, windowId) {
+    // Remove the recording bar/camera before showing the post-record popup.
+    teardown();
+    ensureHost();
+    postrecEl = document.createElement('div');
+    postrecEl.className = 'qr-postrec';
+    postrecEl.innerHTML = `
+      <div class="qr-postrec-title">Recording saved</div>
+      <div class="qr-postrec-sub">Auto-downloads in <span data-qr="countdown">30</span>s.</div>
+      <div class="qr-postrec-buttons">
+        <button class="qr-postrec-btn primary" data-qr="download">⬇ Download</button>
+        <button class="qr-postrec-btn secondary" data-qr="edit">✂ Edit</button>
+      </div>
+      <div class="qr-postrec-progress"><div class="qr-postrec-progress-fill" data-qr="bar"></div></div>
+    `;
+    shadow.appendChild(postrecEl);
+    const countdownEl = postrecEl.querySelector('[data-qr="countdown"]');
+    const barEl = postrecEl.querySelector('[data-qr="bar"]');
+    const total = 30000;
+    const startedAt = Date.now();
+    const tick = () => {
+      const elapsed = Date.now() - startedAt;
+      const remain = Math.max(0, total - elapsed);
+      countdownEl.textContent = Math.ceil(remain / 1000);
+      barEl.style.transform = `scaleX(${remain / total})`;
+      if (remain <= 0) {
+        triggerDownload();
+      }
+    };
+    tick();
+    postrecTimer = setInterval(tick, 200);
+
+    postrecEl.querySelector('[data-qr="download"]').addEventListener('click', triggerDownload);
+    postrecEl.querySelector('[data-qr="edit"]').addEventListener('click', triggerEdit);
+
+    function triggerDownload() {
+      if (!postrecEl) return;
+      chrome.runtime.sendMessage({
+        target: 'offscreen',
+        type: 'downloadRecording',
+        id: recordingId,
+        deleteAfter: true
+      }).catch(() => {});
+      chrome.runtime.sendMessage({ target: 'sw', type: 'postRecordResolved' }).catch(() => {});
+      dismissPostRec();
+    }
+    function triggerEdit() {
+      if (!postrecEl) return;
+      chrome.runtime.sendMessage({
+        target: 'sw',
+        type: 'openEditor',
+        recordingId,
+        windowId
+      }).catch(() => {});
+      chrome.runtime.sendMessage({ target: 'sw', type: 'postRecordResolved' }).catch(() => {});
+      dismissPostRec();
+    }
+  }
+
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || msg.target !== 'content') return false;
     console.log('[QR content] msg:', msg.type);
     switch (msg.type) {
       case 'init': init(msg); break;
       case 'restarted': onRestarted(msg); break;
-      case 'cleanup': teardown(); break;
+      case 'cleanup': teardown(); dismissPostRec(); break;
+      case 'showPostRecord': showPostRecord(msg.recordingId, msg.windowId); break;
     }
     return false;
   });

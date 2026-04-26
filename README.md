@@ -1,18 +1,19 @@
 # Quick Recorder
 
-A one-click Chrome extension that records the active tab — screen, camera (as a draggable overlay), and microphone — into a single MP4 file.
+A one-click Chrome extension that records the active tab — screen, camera (as a draggable overlay), and microphone — into a single MP4 file. Comes with a built-in editor for trimming and re-sizing.
 
-No screen picker, no setup once installed. Click the icon, get a 3-second countdown, recording starts. Click again to stop, the file downloads automatically named after the tab.
+No screen picker, no setup once installed. Click the icon, get a 3-second countdown, recording starts. Click again to stop. A bottom-left popup lets you Download or Edit (auto-downloads after 30s if you do nothing).
 
 ## Features
 
 - **One-click recording** — no picker dialog. Uses `chrome.tabCapture` to start instantly on the current tab.
-- **Camera overlay** — draggable, resizable rounded-rectangle webcam bubble. Position is remembered between sessions.
-- **Audio** — microphone + tab audio, mixed into a single track.
+- **Camera overlay** — draggable, resizable rounded-rectangle webcam bubble. Position is remembered. A subtle saturation/contrast filter is always on so the MacBook camera looks less washed out.
+- **Audio** — microphone + tab audio, mixed into a single track. Mic priority: USB → Bluetooth/AirPods → built-in.
+- **Built-in editor** — after recording, a popup offers Download or Edit. Edit opens a tab with a video player + timeline. Set trim start/end, mark cut regions to delete, scrub the playhead. Re-export to a target file size (5/10/25/50/100/250 MB or Original) — the editor picks the resolution and bitrate automatically. Powered by ffmpeg.wasm (single-thread).
+- **Project library** — recordings you opened in the editor but didn't export persist in a sidebar so you can come back to them.
 - **MP4 output** — native `MediaRecorder` MP4 (Chrome 130+). Falls back to WebM on older versions.
-- **Compact controls** — bar with timer, retry, stop, and icon-button menus for camera/mic device selection.
 - **File named after the tab** — recording on a tab titled "Above and Beyond" downloads as `Above and Beyond.mp4`.
-- **1080p / 30fps** — capped to keep file size manageable (~12 MB/min).
+- **1080p / 30fps** — capped to keep raw file size manageable (~12 MB/min). The editor can re-encode smaller.
 
 ## Install (unpacked)
 
@@ -42,9 +43,12 @@ No screen picker, no setup once installed. Click the icon, get a 3-second countd
 ## Architecture
 
 - `manifest.json` — MV3
-- `background.js` — service worker, orchestrator. Owns action click → tab capture → offscreen lifecycle → downloads.
-- `offscreen.js` — owns `MediaRecorder`, audio mixing graph, blob assembly. Captures via `chrome.tabCapture` stream id passed from the SW.
-- `content.js` — injected into the active tab. Renders the floating control bar and camera bubble inside a Shadow DOM (so hostile page CSS can't break it).
+- `background.js` — service worker, orchestrator. Owns action click → tab capture → offscreen lifecycle → editor tab spawning → downloads.
+- `offscreen.js` — owns `MediaRecorder`, audio mixing graph, blob assembly. Saves recordings to IndexedDB on stop.
+- `content.js` — injected into the active tab. Renders the floating control bar, camera bubble, and post-record popup inside a Shadow DOM.
+- `editor.html` / `editor.js` / `editor.css` — full-page editor in a separate tab. Reads recording from IndexedDB, renders timeline canvas, trim/cut interactions, runs ffmpeg.wasm for re-encoding.
+- `lib/db.js` — IndexedDB helper shared by SW, offscreen, editor.
+- `lib/ffmpeg/` — bundled ffmpeg.wasm (~32 MB) for client-side re-encoding.
 - `permissions.html` / `permissions.js` — first-run page that triggers the mic permission prompt.
 - `icons/` — record-dot icon at 16/32/48/128 px.
 

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quick Recorder — Editor</title>
+  <link rel="stylesheet" href="editor.css" />
+  <link rel="icon" href="icons/icon128.png" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <img src="icons/icon128.png" class="logo" alt="" />
+      <h1 class="title" data-qr="title">Editor</h1>
+    </div>
+    <div class="topbar-right">
+      <div class="quality">
+        <label class="quality-label">Export size</label>
+        <input type="range" min="0" max="6" step="1" value="4" data-qr="quality-slider" class="quality-slider" />
+        <div class="quality-info">
+          <strong data-qr="quality-target">50 MB</strong>
+          <span data-qr="quality-detail">1080p · est. 50 MB</span>
+        </div>
+      </div>
+      <button class="btn primary" data-qr="export">Export &amp; Download</button>
+    </div>
+  </header>
+
+  <main class="main">
+    <aside class="sidebar">
+      <div class="sidebar-title">In progress</div>
+      <div class="sidebar-list" data-qr="library"></div>
+    </aside>
+
+    <section class="stage">
+      <div class="player-wrap">
+        <video data-qr="video" playsinline></video>
+      </div>
+      <div class="timeline-wrap">
+        <canvas data-qr="timeline" height="80"></canvas>
+        <div class="time-labels">
+          <span data-qr="time-current">0:00</span>
+          <span data-qr="time-duration">0:00</span>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button class="btn icon" data-qr="play" title="Play / pause (space)">▶</button>
+        <span class="divider"></span>
+        <button class="btn" data-qr="set-trim-start" title="Set trim start to playhead">⇤ Set start</button>
+        <button class="btn" data-qr="set-trim-end" title="Set trim end to playhead">⇥ Set end</button>
+        <span class="divider"></span>
+        <button class="btn" data-qr="add-cut" title="Add a cut region at the playhead">✂ Add cut</button>
+        <button class="btn danger" data-qr="delete-region" title="Delete the selected cut region">🗑 Delete cut</button>
+        <span class="divider"></span>
+        <button class="btn" data-qr="reset" title="Reset all edits">↺ Reset</button>
+      </div>
+    </section>
+  </main>
+
+  <div class="overlay" data-qr="overlay" hidden>
+    <div class="overlay-card">
+      <h3 data-qr="overlay-title">Loading…</h3>
+      <p data-qr="overlay-msg">Please wait.</p>
+      <div class="progress"><div class="progress-fill" data-qr="overlay-progress"></div></div>
+    </div>
+  </div>
+
+  <script src="lib/db.js"></script>
+  <script src="editor.js"></script>
+</body>
+</html>

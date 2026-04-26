@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Quick Recorder",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "One-click screen + camera + mic recording with floating camera overlay",
   "permissions": [
     "offscreen",
@@ -11,11 +11,24 @@
     "downloads",
     "activeTab",
     "notifications",
-    "tabCapture"
+    "tabCapture",
+    "contextMenus",
+    "unlimitedStorage"
   ],
   "web_accessible_resources": [
     {
-      "resources": ["permissions.html"],
+      "resources": [
+        "permissions.html",
+        "editor.html",
+        "editor.css",
+        "editor.js",
+        "lib/db.js",
+        "lib/ffmpeg/ffmpeg.js",
+        "lib/ffmpeg/814.ffmpeg.js",
+        "lib/ffmpeg/ffmpeg-core.js",
+        "lib/ffmpeg/ffmpeg-core.wasm",
+        "icons/icon128.png"
+      ],
       "matches": ["<all_urls>"]
     }
   ],

@@ -62,12 +62,25 @@ function notify(title, message) {
   }
 }
 
+// Sort mics by priority: USB → Bluetooth (incl. AirPods) → built-in → other.
+// Heuristic on label strings since the browser doesn't expose connection bus.
+function micPriorityRank(label) {
+  const l = (label || '').toLowerCase();
+  if (/usb/.test(l)) return 0;
+  if (/airpod|bluetooth|wireless|headphone|headset|earbud/.test(l)) return 1;
+  if (/built-?in|macbook|internal|default/.test(l)) return 3;
+  return 2;
+}
+
 async function listMics() {
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices
+    const mics = devices
       .filter((d) => d.kind === 'audioinput')
+      .filter((d) => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications')
       .map((d) => ({ id: d.deviceId, label: d.label || 'Microphone' }));
+    mics.sort((a, b) => micPriorityRank(a.label) - micPriorityRank(b.label));
+    return mics;
   } catch {
     return [];
   }
@@ -108,12 +121,12 @@ async function acquireStreams(streamId) {
     }
   } catch (e) { console.warn('[QR offscreen] passthrough audio failed', e); }
 
-  // 2. Mic — OPTIONAL. Offscreen documents are hidden, so Chrome can't anchor
-  //    a permission prompt to them. If the user hasn't pre-granted mic to the
-  //    extension via the permissions.html page, this throws — we keep
-  //    recording without mic instead of failing the whole session.
+  // 2. Mic — OPTIONAL with priority selection. Always prefer USB → Bluetooth
+  //    → built-in. Offscreen documents are hidden, so Chrome can't anchor a
+  //    permission prompt to them; if not pre-granted, we record without mic.
   micStream = null;
   try {
+    // First permission check / grant
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -122,7 +135,30 @@ async function acquireStreams(streamId) {
       },
       video: false
     });
-    console.log('[QR offscreen] mic acquired');
+    console.log('[QR offscreen] mic acquired (default)');
+
+    // Re-pick by priority once labels are populated.
+    const mics = await listMics();
+    const top = mics[0];
+    const currentTrack = micStream.getAudioTracks()[0];
+    const currentId = currentTrack?.getSettings?.().deviceId;
+    if (top && top.id !== currentId) {
+      console.log('[QR offscreen] switching to higher-priority mic:', top.label);
+      try {
+        const better = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: { exact: top.id },
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: false
+          }
+        });
+        micStream.getTracks().forEach((t) => t.stop());
+        micStream = better;
+      } catch (e) {
+        console.warn('[QR offscreen] priority mic unavailable, keeping default:', e?.message || e);
+      }
+    }
   } catch (e) {
     console.warn('[QR offscreen] mic unavailable, continuing without mic:', e?.message || e);
     send({ type: 'micPermissionMissing' });
@@ -199,17 +235,38 @@ function startRecorder() {
     send({ type: 'error', error: 'MediaRecorder error: ' + (e.error?.message || e.error || 'unknown') });
     cleanup();
   };
-  recorder.onstop = () => {
+  recorder.onstop = async () => {
     const blob = new Blob(chunks, { type: recMime || 'video/webm' });
-    const url = URL.createObjectURL(blob);
-    liveBlobUrls.add(url);
-    send({ type: 'recordingEnded', blobUrl: url, ext: recExt });
+    const durationMs = Date.now() - recorderStartedAt;
     chunks = [];
+    try {
+      // Detect whether the final stream had any audio track at all (mic + tab
+      // audio could have both failed). The editor uses this to skip [0:a] in
+      // the filter graph for video-only files.
+      const hadAudio = mixedStream && mixedStream.getAudioTracks().length > 0;
+      const id = await QRDB.save({
+        blob,
+        mime: recMime || 'video/webm',
+        ext: recExt,
+        title: pendingTitle,
+        durationMs,
+        hasAudio: hadAudio
+      });
+      console.log('[QR offscreen] saved recording id=', id, 'size=', blob.size);
+      send({ type: 'recordingEnded', recordingId: id, ext: recExt, sizeBytes: blob.size, durationMs });
+    } catch (e) {
+      console.error('[QR offscreen] failed to save recording', e);
+      send({ type: 'error', error: 'Failed to save recording: ' + (e.message || e) });
+    }
     cleanup();
   };
   recorder.start(2000); // 2-second timeslice
+  recorderStartedAt = Date.now();
   phase = 'recording';
 }
+
+// Title hint passed from SW so the saved recording remembers the source tab.
+let pendingTitle = '';
 
 function stopRecorder() {
   if (recorder && recorder.state !== 'inactive') {
@@ -308,6 +365,41 @@ async function changeMic(deviceId) {
   }
 }
 
+// Read a recording from IDB, save to disk via chrome.downloads, then optionally
+// delete. Handles its own blob URL lifecycle.
+async function downloadRecording(id, deleteAfter = true) {
+  try {
+    const rec = await QRDB.get(id);
+    if (!rec) {
+      console.warn('[QR offscreen] downloadRecording: id not found', id);
+      return;
+    }
+    const url = URL.createObjectURL(rec.blob);
+    liveBlobUrls.add(url);
+    const safeTitle = (rec.title || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+    const fallback = `Recording_${new Date(rec.createdAt).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+    const filename = `${safeTitle || fallback}.${rec.ext || 'mp4'}`;
+    const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
+    const onChanged = (delta) => {
+      if (delta.id !== downloadId) return;
+      const s = delta.state?.current;
+      if (s !== 'complete' && s !== 'interrupted') return;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      try { URL.revokeObjectURL(url); } catch {}
+      liveBlobUrls.delete(url);
+      if (deleteAfter && s === 'complete') {
+        QRDB.remove(id).catch(() => {});
+      } else if (s === 'complete') {
+        QRDB.setStatus(id, 'exported').catch(() => {});
+      }
+    };
+    chrome.downloads.onChanged.addListener(onChanged);
+  } catch (e) {
+    console.error('[QR offscreen] downloadRecording failed', e);
+    notify('Download failed', e.message || String(e));
+  }
+}
+
 function cleanup() {
   try { stopRecorder(); } catch {}
   recorder = null;
@@ -325,10 +417,14 @@ function cleanup() {
 // Track URLs we've created so we can revoke after download completes.
 const liveBlobUrls = new Set();
 
+// Track recording start time so onstop can compute duration.
+let recorderStartedAt = 0;
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || msg.target !== 'offscreen') return false;
   switch (msg.type) {
-    case 'startTabCapture': start(msg.streamId, msg.tabId); break;
+    case 'startTabCapture': pendingTitle = msg.tabTitle || ''; start(msg.streamId, msg.tabId); break;
+    case 'downloadRecording': downloadRecording(msg.id, msg.deleteAfter !== false); break;
     case 'beginRecord': beginRecord(); break;
     case 'stop': stopRecording(); break;
     case 'retry': retry(); break;

@@ -2,12 +2,15 @@
 // Owns: action click, offscreen lifecycle, content-script injection, downloads.
 // Never owns streams.
 
+// Pull in shared IndexedDB helper. db.js exposes self.QRDB.
+try { importScripts('lib/db.js'); } catch (e) { console.warn('[QR sw] importScripts(db.js) failed', e); }
+
 const OFFSCREEN_PATH = 'offscreen.html';
 
 // In-memory state. SW dies, but offscreen doc keeps SW alive during recording.
 // `startedAt > 0` means recording has truly begun (post-countdown). During the
 // startup window (picker + countdown), startedAt stays 0.
-let state = { startedAt: 0, tabId: null, tabTitle: '', mics: [], uiTabs: [] };
+let state = { startedAt: 0, tabId: null, windowId: null, tabTitle: '', mics: [], uiTabs: [] };
 
 // Restore on cold start. Only apply if in-memory state is still pristine —
 // otherwise a click handler already mutated state and a late restore would
@@ -96,7 +99,7 @@ function broadcastCleanup() {
 
 function resetState() {
   broadcastCleanup();
-  state = { startedAt: 0, tabId: null, tabTitle: '', mics: [], uiTabs: [] };
+  state = { startedAt: 0, tabId: null, windowId: null, tabTitle: '', mics: [], uiTabs: [] };
   persist().catch(() => {});
   setBadge(false);
 }
@@ -155,11 +158,18 @@ chrome.action.onClicked.addListener(async (tab) => {
 
   await ensureOffscreen();
   state.tabId = tab.id;
+  state.windowId = tab.windowId;
   // Capture the title at click time — this is the tab the recording is starting
   // on, even if the tab later navigates to a different page.
   state.tabTitle = tab.title || '';
   chrome.runtime
-    .sendMessage({ target: 'offscreen', type: 'startTabCapture', streamId, tabId: tab.id })
+    .sendMessage({
+      target: 'offscreen',
+      type: 'startTabCapture',
+      streamId,
+      tabId: tab.id,
+      tabTitle: tab.title || ''
+    })
     .catch((e) => {
       console.warn('[QR sw] startTabCapture send failed', e);
       resetState();
@@ -173,6 +183,24 @@ chrome.action.onClicked.addListener(async (tab) => {
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   if (reason === 'install') {
     chrome.tabs.create({ url: chrome.runtime.getURL('permissions.html') });
+  }
+  // Recreate context menu items (idempotent: remove all then add).
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'qr-open-library',
+      title: 'Open Quick Recorder library',
+      contexts: ['action']
+    });
+  });
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === 'qr-open-library') {
+    const windowId = tab?.windowId;
+    chrome.tabs.create({
+      url: chrome.runtime.getURL('editor.html?library=1'),
+      ...(windowId ? { windowId } : {})
+    });
   }
 });
 
@@ -219,21 +247,51 @@ async function handleSW(msg, sender) {
       break;
     }
     case 'recordingEnded': {
-      const safeTitle = sanitizeFilename(state.tabTitle);
-      const fallback = `Recording_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
-      const filename = `${safeTitle || fallback}.${msg.ext || 'mp4'}`;
-      const url = msg.blobUrl;
-      try {
-        const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
-        // Track the in-flight download so the top-level onChanged listener can
-        // revoke the blob URL on terminal state. Top-level registration is
-        // required so the listener survives SW restarts mid-download.
-        pendingRevokes.set(downloadId, url);
-      } catch (e) {
-        console.error('[QR] download failed', e);
-        chrome.runtime.sendMessage({ target: 'offscreen', type: 'revokeBlob', url }).catch(() => {});
+      // v2: recording is now saved to IDB by offscreen. Show the post-record
+      // popup in the recording tab; user picks Download or Edit. Do NOT
+      // auto-download immediately.
+      const recordingId = msg.recordingId;
+      const tabId = state.tabId;
+      const windowId = state.windowId;
+      // Stop the bar/timer in the tab, but keep tabId/windowId in state until
+      // the popup resolves (Download / Edit / 30s auto).
+      setBadge(false);
+      state.startedAt = 0;
+      await persist();
+      if (tabId) {
+        chrome.tabs.sendMessage(tabId, {
+          target: 'content',
+          type: 'showPostRecord',
+          recordingId,
+          windowId
+        }).catch(() => {});
       }
+      break;
+    }
+    case 'postRecordResolved': {
+      // Content popup was clicked or timed out. Fully reset SW state.
       resetState();
+      break;
+    }
+    case 'openEditor': {
+      // Mark the recording as 'editing', then open the editor tab in the same
+      // Chrome window where it was recorded. If that window is gone, fall
+      // back to opening the tab in any window.
+      try {
+        await QRDB.setStatus(msg.recordingId, 'editing');
+      } catch (e) { console.warn('[QR sw] setStatus editing failed', e); }
+      const url = chrome.runtime.getURL(`editor.html?id=${encodeURIComponent(msg.recordingId)}`);
+      try {
+        if (msg.windowId) {
+          await chrome.tabs.create({ url, windowId: msg.windowId });
+        } else {
+          await chrome.tabs.create({ url });
+        }
+      } catch (e) {
+        console.warn('[QR sw] open editor (windowed) failed, retrying without windowId', e);
+        try { await chrome.tabs.create({ url }); }
+        catch (e2) { console.error('[QR sw] open editor failed entirely', e2); }
+      }
       break;
     }
     case 'recordingRestarted': {
@@ -334,14 +392,3 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   persist().catch(() => {});
 });
 
-// ── Top-level downloads listener (survives SW restart) ────────────────────────
-const pendingRevokes = new Map(); // downloadId -> blobUrl
-
-chrome.downloads.onChanged.addListener((delta) => {
-  if (!pendingRevokes.has(delta.id)) return;
-  const s = delta.state?.current;
-  if (s !== 'complete' && s !== 'interrupted') return;
-  const url = pendingRevokes.get(delta.id);
-  pendingRevokes.delete(delta.id);
-  chrome.runtime.sendMessage({ target: 'offscreen', type: 'revokeBlob', url }).catch(() => {});
-});
