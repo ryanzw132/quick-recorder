@@ -245,6 +245,25 @@ function startRecorder() {
   };
   if (chosenMime) opts.mimeType = chosenMime;
 
+  // Diagnostic dump of every track in the stream we're about to record.
+  console.log('[QR offscreen] === recorder.start tracks ===');
+  console.log('[QR offscreen] mime:', chosenMime || '(default)');
+  mixedStream.getTracks().forEach((t) => {
+    let settings = {};
+    try { settings = t.getSettings ? t.getSettings() : {}; } catch {}
+    console.log('[QR offscreen]   track:', {
+      kind: t.kind,
+      id: t.id,
+      label: t.label,
+      enabled: t.enabled,
+      muted: t.muted,
+      readyState: t.readyState,
+      deviceId: settings.deviceId,
+      sampleRate: settings.sampleRate,
+      channelCount: settings.channelCount
+    });
+  });
+
   recorder = new MediaRecorder(mixedStream, opts);
   // Capture the mime/ext that this specific recorder used, so a later mime
   // change (e.g. after retry probe) doesn't taint the saved file extension.
@@ -285,6 +304,48 @@ function startRecorder() {
   recorder.start(2000); // 2-second timeslice
   recorderStartedAt = Date.now();
   phase = 'recording';
+
+  // Live audio level meter — samples the destNode (or raw mic) every second
+  // and logs RMS energy. Helps confirm whether silent recordings are due to
+  // the source being silent or the pipeline being silent.
+  startAudioMeter();
+}
+
+function startAudioMeter() {
+  stopAudioMeter();
+  const audioTrack = mixedStream.getAudioTracks()[0];
+  if (!audioTrack) {
+    console.log('[QR offscreen] no audio track — meter disabled');
+    return;
+  }
+  try {
+    const meterCtx = new AudioContext();
+    if (meterCtx.state === 'suspended') meterCtx.resume().catch(() => {});
+    const meterStream = new MediaStream([audioTrack]);
+    const src = meterCtx.createMediaStreamSource(meterStream);
+    const analyser = meterCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    src.connect(analyser);
+    const buf = new Float32Array(analyser.fftSize);
+    audioMeterCtx = meterCtx;
+    audioMeterInterval = setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+      const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+      console.log('[QR offscreen] audio level (RMS):', rms.toFixed(4), 'dBFS:', dbfs.toFixed(1));
+    }, 1000);
+  } catch (e) {
+    console.warn('[QR offscreen] audio meter failed', e);
+  }
+}
+
+let audioMeterCtx = null;
+let audioMeterInterval = null;
+function stopAudioMeter() {
+  if (audioMeterInterval) { clearInterval(audioMeterInterval); audioMeterInterval = null; }
+  if (audioMeterCtx) { try { audioMeterCtx.close(); } catch {} audioMeterCtx = null; }
 }
 
 // Title hint passed from SW so the saved recording remembers the source tab.
@@ -424,6 +485,7 @@ async function downloadRecording(id, deleteAfter = true) {
 
 function cleanup() {
   try { stopRecorder(); } catch {}
+  try { stopAudioMeter(); } catch {}
   recorder = null;
   if (screenStream) screenStream.getTracks().forEach((t) => t.stop());
   if (micStream) micStream.getTracks().forEach((t) => t.stop());
