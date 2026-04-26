@@ -222,11 +222,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.target) return false;
 
   if (msg.target === 'sw') {
-    handleSW(msg, sender);
-    return false;
+    // Return true to keep the message channel open so the SW stays alive
+    // through async work (e.g. IDB read + chrome.downloads.download).
+    handleSW(msg, sender).then((r) => sendResponse(r ?? null)).catch((e) => {
+      console.error('[QR sw] handleSW threw', e);
+      sendResponse({ error: String(e) });
+    });
+    return true;
   }
   if (msg.target === 'offscreen') {
-    // Offscreen doc receives the same broadcast directly — no relay needed.
     return false;
   }
   if (msg.target === 'content' && state.tabId) {
@@ -430,23 +434,47 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 const pendingDownloads = new Map(); // downloadId -> { url, recordingId, deleteAfter }
 
 async function handleDownloadRecording(id, deleteAfter) {
+  console.log('[QR sw] handleDownloadRecording id=', id, 'deleteAfter=', deleteAfter);
+  let rec;
   try {
-    console.log('[QR sw] handleDownloadRecording id=', id);
-    const rec = await QRDB.get(id);
-    if (!rec) {
-      console.warn('[QR sw] downloadRecording: id not found', id);
-      notify('Download failed', 'Recording not found in storage. It may have been deleted.');
-      return;
-    }
-    const url = URL.createObjectURL(rec.blob);
-    const safe = sanitizeFilename(rec.title);
-    const fallback = `Recording_${new Date(rec.createdAt || Date.now()).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
-    const filename = `${safe || fallback}.${rec.ext || 'mp4'}`;
-    const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
-    pendingDownloads.set(downloadId, { url, recordingId: id, deleteAfter });
-    console.log('[QR sw] download started, downloadId=', downloadId, 'filename=', filename);
+    rec = await QRDB.get(id);
   } catch (e) {
-    console.error('[QR sw] download failed', e);
+    console.error('[QR sw] QRDB.get threw', e);
+    notify('Download failed', 'Could not read recording from storage: ' + (e.message || e));
+    return;
+  }
+  if (!rec) {
+    console.warn('[QR sw] downloadRecording: id not found', id);
+    notify('Download failed', 'Recording not found in storage. It may have been deleted.');
+    return;
+  }
+  if (!rec.blob || !rec.blob.size) {
+    console.error('[QR sw] recording blob is empty', rec);
+    notify('Download failed', 'Recording is empty (0 bytes).');
+    return;
+  }
+  let url;
+  try {
+    url = URL.createObjectURL(rec.blob);
+  } catch (e) {
+    console.error('[QR sw] URL.createObjectURL threw', e);
+    notify('Download failed', 'Could not create blob URL: ' + (e.message || e));
+    return;
+  }
+  const safe = sanitizeFilename(rec.title);
+  const fallback = `Recording_${new Date(rec.createdAt || Date.now()).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+  const filename = `${safe || fallback}.${rec.ext || 'mp4'}`;
+  console.log('[QR sw] requesting chrome.downloads.download, filename=', filename, 'size=', rec.blob.size);
+  try {
+    const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
+    if (downloadId === undefined) {
+      throw new Error(chrome.runtime.lastError?.message || 'chrome.downloads.download returned no id');
+    }
+    pendingDownloads.set(downloadId, { url, recordingId: id, deleteAfter });
+    console.log('[QR sw] download started, downloadId=', downloadId);
+  } catch (e) {
+    console.error('[QR sw] chrome.downloads.download threw', e);
+    try { URL.revokeObjectURL(url); } catch {}
     notify('Download failed', e.message || String(e));
   }
 }

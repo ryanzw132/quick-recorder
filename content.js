@@ -163,14 +163,12 @@
     }
     .qr-cam.qr-dragging { cursor: grabbing; }
     .qr-cam.qr-hidden { display: none !important; }
-    .qr-cam video {
+    .qr-cam iframe {
       width: 100% !important; height: 100% !important;
-      object-fit: cover !important;
+      border: 0 !important;
       display: block !important;
-      /* Mirror + light "vibrant natural" filter: subtle saturation/contrast lift
-         so the MacBook camera looks less dull. Always on. */
-      transform: scaleX(-1) !important;
-      filter: saturate(1.18) contrast(1.06) brightness(1.04) !important;
+      /* Iframe captures pointer events by default, which would break drag.
+         Disable so the wrapper div catches mousedown for drag/resize. */
       pointer-events: none !important;
     }
     .qr-cam-resize {
@@ -247,9 +245,9 @@
   let bar = null;
   let timerEl = null;
   let camEl = null;
-  let camVideo = null;
-  let cameraStream = null;
+  let camIframe = null;
   let cameraOn = true;
+  let cameraReady = false;
   let timerInterval = null;
   let mics = [];
   let cams = [];
@@ -291,8 +289,10 @@
     initGen++;
     stopTimer();
     stopCamera();
+    window.removeEventListener('message', onIframeMessage);
     if (host && host.parentNode) host.parentNode.removeChild(host);
-    host = shadow = bar = timerEl = camEl = camVideo = null;
+    host = shadow = bar = timerEl = camEl = camIframe = null;
+    cameraReady = false;
     initialised = false;
   }
 
@@ -334,61 +334,53 @@
     camEl.style.top = t.y + 'px';
     camEl.style.width = t.w + 'px';
     camEl.style.height = t.h + 'px';
-    camVideo = document.createElement('video');
-    camVideo.autoplay = true;
-    camVideo.playsInline = true;
-    camVideo.muted = true;
-    camEl.appendChild(camVideo);
+    // Camera lives in an iframe loaded from the extension origin so the user
+    // grants camera permission ONCE (in permissions.html) and it works on
+    // every website. Setting `allow="camera"` lets the cross-origin iframe
+    // use the camera per Permissions Policy.
+    camIframe = document.createElement('iframe');
+    camIframe.src = chrome.runtime.getURL('camera.html');
+    camIframe.setAttribute('allow', 'camera');
+    camEl.appendChild(camIframe);
     const handle = document.createElement('div');
     handle.className = 'qr-cam-resize';
     camEl.appendChild(handle);
     shadow.appendChild(camEl);
     attachDrag(camEl, handle, t);
-    await startCamera();
+    window.addEventListener('message', onIframeMessage);
+    // Iframe auto-starts on load; nothing more to do here.
   }
 
-  async function startCamera(deviceId) {
-    try {
-      stopCamera();
-      const constraints = {
-        video: deviceId
-          ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
-          : { width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: false
-      };
-      cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
-      camVideo.srcObject = cameraStream;
-      camEl?.classList.remove('qr-hidden');
-      // Recover gracefully if the camera disappears (USB unplug, etc.)
-      const vt = cameraStream.getVideoTracks()[0];
-      if (vt) {
-        vt.addEventListener('ended', () => {
-          if (camEl) camEl.classList.add('qr-hidden');
-        });
-      }
-      await refreshDevices();
-      if (vt && vt.getSettings) {
-        currentCamId = vt.getSettings().deviceId || currentCamId;
-      }
+  function onIframeMessage(e) {
+    if (!camIframe || e.source !== camIframe.contentWindow) return;
+    const m = e.data;
+    if (!m || !m.qr) return;
+    if (m.qr === 'cam-ready') {
+      cameraReady = true;
+      cams = m.cams || [];
+      if (m.activeId) currentCamId = m.activeId;
       updateBarSelects();
-    } catch (e) {
-      console.warn('[QR] camera unavailable', e);
+    } else if (m.qr === 'cam-error') {
+      console.warn('[QR] camera unavailable:', m.message);
       cameraOn = false;
+      cameraReady = true; // unblock waitForCameraReady so countdown can proceed
       if (camEl) camEl.classList.add('qr-hidden');
-      const btn = bar?.querySelector('[data-qr="cam-toggle"]');
-      if (btn) {
-        btn.classList.add('qr-off');
-        btn.title = 'Camera unavailable on this site (permission denied or blocked)';
-      }
+      updateBarSelects();
     }
+  }
+
+  function postToCam(payload) {
+    if (camIframe?.contentWindow) camIframe.contentWindow.postMessage(payload, '*');
+  }
+
+  function startCamera(deviceId) {
+    if (deviceId) currentCamId = deviceId;
+    postToCam({ qr: 'cam-start', deviceId });
+    if (camEl) camEl.classList.remove('qr-hidden');
   }
 
   function stopCamera() {
-    if (cameraStream) {
-      cameraStream.getTracks().forEach((t) => t.stop());
-      cameraStream = null;
-    }
-    if (camVideo) camVideo.srcObject = null;
+    postToCam({ qr: 'cam-stop' });
   }
 
   // Same priority logic as offscreen.js — keep both in sync.
@@ -399,18 +391,9 @@
     if (/built-?in|macbook|internal|default/.test(l)) return 3;
     return 2;
   }
-  async function refreshDevices() {
-    try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      cams = devices.filter((d) => d.kind === 'videoinput')
-        .map((d) => ({ id: d.deviceId, label: d.label || 'Camera' }));
-      const newMics = devices.filter((d) => d.kind === 'audioinput')
-        .filter((d) => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications')
-        .map((d) => ({ id: d.deviceId, label: d.label || 'Microphone' }));
-      newMics.sort((a, b) => micPriorityRank(a.label) - micPriorityRank(b.label));
-      if (newMics.length && newMics[0].label) mics = newMics;
-    } catch {}
-  }
+  // Mic list is provided by the SW (offscreen enumerates from extension origin
+  // where labels are populated). Camera list is provided by the iframe.
+  // No content-side enumerateDevices needed.
 
   // ── Camera drag/resize ────────────────────────────────────────────────────
   function attachDrag(target, handle, transform) {
@@ -582,19 +565,17 @@
     if (camEl) camEl.classList.toggle('qr-hidden', !cameraOn);
     const btn = bar?.querySelector('[data-qr="cam-btn"]');
     if (btn) btn.classList.toggle('qr-off', !cameraOn);
-    if (cameraOn && !cameraStream) startCamera(currentCamId);
-    else if (!cameraOn) stopCamera();
+    if (cameraOn) startCamera(currentCamId);
+    else stopCamera();
   }
 
   async function waitForCameraReady() {
-    if (!camVideo) return;
-    if (camVideo.readyState >= 3 /* HAVE_FUTURE_DATA */ && !camVideo.paused) return;
+    if (cameraReady) return;
     await new Promise((resolve) => {
       let done = false;
       const fin = () => { if (!done) { done = true; resolve(); } };
-      camVideo.addEventListener('playing', fin, { once: true });
-      camVideo.addEventListener('loadeddata', fin, { once: true });
-      setTimeout(fin, 1500); // safety
+      const tick = setInterval(() => { if (cameraReady) { clearInterval(tick); fin(); } }, 50);
+      setTimeout(() => { clearInterval(tick); fin(); }, 2500);
     });
   }
 
