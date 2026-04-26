@@ -16,10 +16,10 @@
     <div class="topbar-right">
       <div class="quality">
         <label class="quality-label">Export size</label>
-        <input type="range" min="0" max="6" step="1" value="4" data-qr="quality-slider" class="quality-slider" />
+        <input type="range" min="0" max="7" step="1" value="2" data-qr="quality-slider" class="quality-slider" />
         <div class="quality-info">
-          <strong data-qr="quality-target">50 MB</strong>
-          <span data-qr="quality-detail">1080p · est. 50 MB</span>
+          <strong data-qr="quality-target">20 MB</strong>
+          <span data-qr="quality-detail">720p · est. 20 MB</span>
         </div>
       </div>
       <button class="btn primary" data-qr="export">Export &amp; Download</button>
@@ -44,13 +44,17 @@
         </div>
       </div>
       <div class="toolbar">
-        <button class="btn icon" data-qr="play" title="Play / pause (space)">▶</button>
+        <button class="btn icon" data-qr="play" title="Play / pause (Space)">▶</button>
+        <div class="volume-wrap" title="Volume">
+          <span class="volume-icon" data-qr="volume-icon">🔊</span>
+          <input type="range" min="0" max="100" value="100" class="volume-slider" data-qr="volume" />
+        </div>
         <span class="divider"></span>
-        <button class="btn" data-qr="set-trim-start" title="Set trim start to playhead">⇤ Set start</button>
-        <button class="btn" data-qr="set-trim-end" title="Set trim end to playhead">⇥ Set end</button>
+        <button class="btn" data-qr="add-cut" title="Cut at playhead (⌘B)">✂ Cut (⌘B)</button>
+        <button class="btn danger" data-qr="delete-region" title="Delete selected section (Delete)">🗑 Delete section</button>
         <span class="divider"></span>
-        <button class="btn" data-qr="add-cut" title="Add a cut region at the playhead">✂ Add cut</button>
-        <button class="btn danger" data-qr="delete-region" title="Delete the selected cut region">🗑 Delete cut</button>
+        <button class="btn icon" data-qr="undo" title="Undo (⌘Z)">↶</button>
+        <button class="btn icon" data-qr="redo" title="Redo (⌘⇧Z)">↷</button>
         <span class="divider"></span>
         <button class="btn" data-qr="reset" title="Reset all edits">↺ Reset</button>
       </div>

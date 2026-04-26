@@ -9,12 +9,14 @@
   const QUALITY_PRESETS = [
     { sizeMB: 5,   label: '5 MB' },
     { sizeMB: 10,  label: '10 MB' },
+    { sizeMB: 20,  label: '20 MB' },
     { sizeMB: 25,  label: '25 MB' },
     { sizeMB: 50,  label: '50 MB' },
     { sizeMB: 100, label: '100 MB' },
     { sizeMB: 250, label: '250 MB' },
     { sizeMB: null, label: 'Original' }
   ];
+  const DEFAULT_QUALITY_INDEX = 2; // 20 MB
 
   const $ = (sel) => document.querySelector(`[data-qr="${sel}"]`);
 
@@ -22,13 +24,20 @@
   let recording = null;        // { id, blob, mime, ext, title, durationMs, ... }
   let videoUrl = null;
   let durationSec = 0;
-  let trimStart = 0;
-  let trimEnd = 0;
-  let cuts = [];               // [{ start, end }] — sorted by start
-  let qualityIndex = 4;        // 100 MB default
-  let activeDrag = null;       // { type: 'trim-start'|'trim-end'|'cut-start'|'cut-end'|'playhead', cutIndex? }
-  let selectedCutIndex = -1;
+  // ── Segment model ────────────────────────────────────────────────────────
+  // Splits is a sorted array including 0 and durationSec at the ends. The
+  // sections between consecutive splits are "segments". segmentDeleted[i]
+  // indicates whether segment i (between splits[i] and splits[i+1]) is
+  // excluded from playback / export.
+  let splits = [0, 0];
+  let segmentDeleted = [false];
+  let selectedSegment = -1;
+  let qualityIndex = DEFAULT_QUALITY_INDEX;
+  let activeDrag = null;       // { type: 'split'|'playhead', splitIndex? }
   let playInterval = null;
+  // Undo/redo
+  let history = [];
+  let historyIndex = -1;
 
   // ── DOM ──────────────────────────────────────────────────────────────────
   const videoEl = $('video');
@@ -144,8 +153,17 @@
       const finalize = () => {
         durationSec = Number.isFinite(videoEl.duration) ? videoEl.duration : fallbackDur;
         if (durationSec <= 0) durationSec = fallbackDur || 0.1;
-        trimEnd = durationSec;
+        // Initialize segment model: a single non-deleted segment from 0 to end.
+        splits = [0, durationSec];
+        segmentDeleted = [false];
+        selectedSegment = -1;
+        history = [];
+        historyIndex = -1;
+        snapshot();
         timeDuration.textContent = fmtTime(durationSec);
+        // Default volume + force unmuted
+        videoEl.volume = 1.0;
+        videoEl.muted = false;
         updateQualityLabel();
         drawTimeline();
       };
@@ -189,40 +207,39 @@
     const h = 80;
     ctx.clearRect(0, 0, w, h);
 
-    // Background bar (full duration in muted)
+    // Background bar (full duration)
     ctx.fillStyle = '#1d2138';
     ctx.fillRect(0, 22, w, 36);
 
-    // Trim region (kept area, blue)
-    ctx.fillStyle = 'rgba(37,99,235,0.18)';
-    ctx.fillRect(timeToX(trimStart), 22, timeToX(trimEnd) - timeToX(trimStart), 36);
+    // Each segment: blue if kept, red-hatched if deleted, brighter if selected.
+    for (let i = 0; i < segmentDeleted.length; i++) {
+      const x1 = timeToX(splits[i]);
+      const x2 = timeToX(splits[i + 1]);
+      const sw = x2 - x1;
+      const isSelected = i === selectedSegment;
+      if (segmentDeleted[i]) {
+        ctx.fillStyle = isSelected ? 'rgba(239,68,68,0.65)' : 'rgba(239,68,68,0.4)';
+        ctx.fillRect(x1, 22, sw, 36);
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = isSelected ? 2 : 1;
+        ctx.strokeRect(x1 + 0.5, 22.5, Math.max(0, sw - 1), 35);
+      } else {
+        ctx.fillStyle = isSelected ? 'rgba(37,99,235,0.45)' : 'rgba(37,99,235,0.22)';
+        ctx.fillRect(x1, 22, sw, 36);
+        if (isSelected) {
+          ctx.strokeStyle = '#2563eb';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x1 + 0.5, 22.5, Math.max(0, sw - 1), 35);
+        }
+      }
+    }
 
-    // Greyed-out region BEFORE trimStart and AFTER trimEnd (excluded)
-    ctx.fillStyle = 'rgba(0,0,0,0.4)';
-    ctx.fillRect(0, 22, timeToX(trimStart), 36);
-    ctx.fillRect(timeToX(trimEnd), 22, w - timeToX(trimEnd), 36);
-
-    // Cut regions (red overlay inside trim)
-    cuts.forEach((c, i) => {
-      const x1 = timeToX(c.start);
-      const x2 = timeToX(c.end);
-      ctx.fillStyle = i === selectedCutIndex ? 'rgba(239,68,68,0.65)' : 'rgba(239,68,68,0.4)';
-      ctx.fillRect(x1, 22, x2 - x1, 36);
-      // hatched outline
-      ctx.strokeStyle = '#ef4444';
-      ctx.lineWidth = i === selectedCutIndex ? 2 : 1;
-      ctx.strokeRect(x1 + 0.5, 22.5, Math.max(0, x2 - x1 - 1), 35);
-    });
-
-    // Trim handles
-    drawHandle(timeToX(trimStart), '#2563eb', 'L');
-    drawHandle(timeToX(trimEnd), '#2563eb', 'R');
-
-    // Cut handles
-    cuts.forEach((c) => {
-      drawHandle(timeToX(c.start), '#ef4444', 'L', 4);
-      drawHandle(timeToX(c.end), '#ef4444', 'R', 4);
-    });
+    // Split markers (interior split points only — endpoints aren't draggable)
+    for (let i = 1; i < splits.length - 1; i++) {
+      const x = timeToX(splits[i]);
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillRect(x - 2, 18, 4, 44);
+    }
 
     // Time ticks on top
     ctx.fillStyle = 'rgba(255,255,255,0.35)';
@@ -249,46 +266,42 @@
     ctx.fill();
   }
 
-  function drawHandle(x, color, side, narrow = 6) {
-    ctx.fillStyle = color;
-    const w = narrow;
-    ctx.fillRect(x - w/2, 18, w, 44);
+  function segmentAtTime(t) {
+    for (let i = 0; i < segmentDeleted.length; i++) {
+      if (t >= splits[i] && t < splits[i + 1]) return i;
+    }
+    if (t >= splits[splits.length - 1]) return segmentDeleted.length - 1;
+    return -1;
   }
 
-  // Hit-test the timeline. Returns drag descriptor or null.
+  // Hit-test: prefer dragging a near split marker; else select segment.
   function hitTest(x) {
     const TOL = 8;
-    if (Math.abs(x - timeToX(trimStart)) < TOL) return { type: 'trim-start' };
-    if (Math.abs(x - timeToX(trimEnd)) < TOL) return { type: 'trim-end' };
-    for (let i = 0; i < cuts.length; i++) {
-      if (Math.abs(x - timeToX(cuts[i].start)) < TOL) return { type: 'cut-start', cutIndex: i };
-      if (Math.abs(x - timeToX(cuts[i].end)) < TOL) return { type: 'cut-end', cutIndex: i };
+    // Only interior splits are draggable
+    for (let i = 1; i < splits.length - 1; i++) {
+      if (Math.abs(x - timeToX(splits[i])) < TOL) {
+        return { type: 'split', splitIndex: i };
+      }
     }
-    // Inside a cut region — select it
-    for (let i = 0; i < cuts.length; i++) {
-      const x1 = timeToX(cuts[i].start), x2 = timeToX(cuts[i].end);
-      if (x >= x1 && x <= x2) return { type: 'select-cut', cutIndex: i };
-    }
-    return { type: 'playhead' };
+    return { type: 'segment', segmentIndex: segmentAtTime(xToTime(x)) };
   }
 
   timelineCanvas.addEventListener('mousedown', (e) => {
     const rect = timelineCanvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const hit = hitTest(x);
-    if (hit.type === 'select-cut') {
-      selectedCutIndex = hit.cutIndex;
-      drawTimeline();
-      return;
-    }
-    activeDrag = hit;
-    if (hit.type === 'playhead') {
+    if (hit.type === 'split') {
+      activeDrag = hit;
+      document.addEventListener('mousemove', onCanvasMove);
+      document.addEventListener('mouseup', onCanvasUp);
+    } else if (hit.type === 'segment') {
+      // First click: select the segment; second click on same area moves the
+      // playhead. To keep things simple: shift-click selects, plain click
+      // both selects AND moves playhead.
+      selectedSegment = hit.segmentIndex;
       videoEl.currentTime = xToTime(x);
+      drawTimeline();
     }
-    selectedCutIndex = -1;
-    document.addEventListener('mousemove', onCanvasMove);
-    document.addEventListener('mouseup', onCanvasUp);
-    drawTimeline();
   });
 
   function onCanvasMove(e) {
@@ -296,58 +309,71 @@
     const rect = timelineCanvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const t = xToTime(x);
-    const d = activeDrag;
-    if (d.type === 'trim-start') {
-      trimStart = Math.max(0, Math.min(trimEnd - 0.1, t));
-      videoEl.currentTime = trimStart;
-    } else if (d.type === 'trim-end') {
-      trimEnd = Math.max(trimStart + 0.1, Math.min(durationSec, t));
-      videoEl.currentTime = trimEnd;
-    } else if (d.type === 'cut-start') {
-      const c = cuts[d.cutIndex];
-      c.start = Math.max(trimStart, Math.min(c.end - 0.05, t));
-      videoEl.currentTime = c.start;
-    } else if (d.type === 'cut-end') {
-      const c = cuts[d.cutIndex];
-      c.end = Math.max(c.start + 0.05, Math.min(trimEnd, t));
-      videoEl.currentTime = c.end;
-    } else if (d.type === 'playhead') {
-      videoEl.currentTime = t;
+    if (activeDrag.type === 'split') {
+      const i = activeDrag.splitIndex;
+      const lo = splits[i - 1] + 0.05;
+      const hi = splits[i + 1] - 0.05;
+      splits[i] = Math.max(lo, Math.min(hi, t));
+      videoEl.currentTime = splits[i];
+      drawTimeline();
+      updateQualityLabel();
     }
+  }
+
+  function onCanvasUp() {
+    if (activeDrag && activeDrag.type === 'split') {
+      snapshot(); // Record drag result for undo.
+    }
+    activeDrag = null;
+    document.removeEventListener('mousemove', onCanvasMove);
+    document.removeEventListener('mouseup', onCanvasUp);
+    drawTimeline();
+  }
+
+  // ── Operations on the segment model ──────────────────────────────────────
+  function makeCutAtPlayhead() {
+    const t = videoEl.currentTime;
+    if (t <= splits[0] + 0.05 || t >= splits[splits.length - 1] - 0.05) return;
+    // Find the segment that contains t.
+    let i = segmentAtTime(t);
+    if (i < 0) return;
+    // Don't cut if t is too close to an existing split.
+    if (Math.abs(splits[i] - t) <= 0.05 || Math.abs(splits[i + 1] - t) <= 0.05) return;
+    splits.splice(i + 1, 0, t);
+    // The new segment inherits the deleted state of its parent.
+    segmentDeleted.splice(i + 1, 0, segmentDeleted[i]);
+    selectedSegment = i + 1;
+    snapshot();
     drawTimeline();
     updateQualityLabel();
   }
 
-  function onCanvasUp() {
-    activeDrag = null;
-    document.removeEventListener('mousemove', onCanvasMove);
-    document.removeEventListener('mouseup', onCanvasUp);
-    // Sort cuts by start, merge overlaps
-    cuts.sort((a, b) => a.start - b.start);
-    for (let i = cuts.length - 2; i >= 0; i--) {
-      if (cuts[i].end >= cuts[i+1].start) {
-        cuts[i].end = Math.max(cuts[i].end, cuts[i+1].end);
-        cuts.splice(i + 1, 1);
-      }
-    }
+  function deleteSelectedSegment() {
+    if (selectedSegment < 0 || selectedSegment >= segmentDeleted.length) return;
+    segmentDeleted[selectedSegment] = true;
+    snapshot();
     drawTimeline();
+    updateQualityLabel();
   }
 
-  // ── Player loop (skip cut regions during playback) ───────────────────────
+  // ── Player loop (skip deleted segments during playback) ──────────────────
   function ensurePlaybackInsideKept() {
     const t = videoEl.currentTime;
-    // Hard clamp to trim
-    if (t < trimStart) { videoEl.currentTime = trimStart; return; }
-    if (t >= trimEnd) {
-      videoEl.pause();
-      videoEl.currentTime = trimEnd;
-      return;
-    }
-    // Skip over cut regions
-    for (const c of cuts) {
-      if (t >= c.start && t < c.end) {
-        videoEl.currentTime = c.end;
-        return;
+    // If we're in a deleted segment, jump to the start of the next kept one.
+    const i = segmentAtTime(t);
+    if (i < 0) return;
+    if (segmentDeleted[i]) {
+      // Skip forward through any consecutive deleted segments.
+      let j = i;
+      while (j < segmentDeleted.length && segmentDeleted[j]) j++;
+      if (j >= segmentDeleted.length) {
+        videoEl.pause();
+        // Park at the end of the last kept segment.
+        let last = segmentDeleted.length - 1;
+        while (last >= 0 && segmentDeleted[last]) last--;
+        videoEl.currentTime = last >= 0 ? splits[last + 1] : 0;
+      } else {
+        videoEl.currentTime = splits[j];
       }
     }
   }
@@ -383,58 +409,101 @@
     if (videoEl.paused) videoEl.play().catch(() => {});
     else videoEl.pause();
   });
-  setTrimStartBtn.addEventListener('click', () => {
-    trimStart = Math.min(videoEl.currentTime, trimEnd - 0.1);
+  if (setTrimStartBtn) setTrimStartBtn.addEventListener('click', () => {
+    // "Set start" = cut at the playhead, then mark everything before as deleted.
+    makeCutAtPlayhead();
+    const i = segmentAtTime(videoEl.currentTime);
+    for (let k = 0; k < i; k++) segmentDeleted[k] = true;
+    snapshot();
     drawTimeline(); updateQualityLabel();
   });
-  setTrimEndBtn.addEventListener('click', () => {
-    trimEnd = Math.max(videoEl.currentTime, trimStart + 0.1);
+  if (setTrimEndBtn) setTrimEndBtn.addEventListener('click', () => {
+    // "Set end" = cut at the playhead, then mark everything after as deleted.
+    makeCutAtPlayhead();
+    const i = segmentAtTime(videoEl.currentTime - 0.001);
+    for (let k = i + 1; k < segmentDeleted.length; k++) segmentDeleted[k] = true;
+    snapshot();
     drawTimeline(); updateQualityLabel();
   });
-  addCutBtn.addEventListener('click', () => {
-    const t = videoEl.currentTime;
-    const len = Math.min(2, (trimEnd - t) / 2);
-    if (len < 0.1) return;
-    const c = { start: t, end: t + len };
-    cuts.push(c);
-    cuts.sort((a, b) => a.start - b.start);
-    selectedCutIndex = cuts.indexOf(c);
-    drawTimeline(); updateQualityLabel();
-  });
-  deleteCutBtn.addEventListener('click', () => {
-    if (selectedCutIndex < 0 || selectedCutIndex >= cuts.length) return;
-    cuts.splice(selectedCutIndex, 1);
-    selectedCutIndex = -1;
-    drawTimeline(); updateQualityLabel();
-  });
+  addCutBtn.addEventListener('click', makeCutAtPlayhead);
+  deleteCutBtn.addEventListener('click', deleteSelectedSegment);
   resetBtn.addEventListener('click', () => {
-    trimStart = 0;
-    trimEnd = durationSec;
-    cuts = [];
-    selectedCutIndex = -1;
+    splits = [0, durationSec];
+    segmentDeleted = [false];
+    selectedSegment = -1;
+    snapshot();
     drawTimeline(); updateQualityLabel();
   });
 
-  // Spacebar = play/pause
+  // ── Undo / redo ───────────────────────────────────────────────────────────
+  function snapshot() {
+    history = history.slice(0, historyIndex + 1);
+    history.push({
+      splits: splits.slice(),
+      segmentDeleted: segmentDeleted.slice(),
+      selectedSegment
+    });
+    historyIndex = history.length - 1;
+    if (history.length > 100) {
+      history.shift();
+      historyIndex--;
+    }
+  }
+  function applySnapshot(s) {
+    splits = s.splits.slice();
+    segmentDeleted = s.segmentDeleted.slice();
+    selectedSegment = s.selectedSegment;
+    drawTimeline();
+    updateQualityLabel();
+  }
+  function undo() {
+    if (historyIndex <= 0) return;
+    historyIndex--;
+    applySnapshot(history[historyIndex]);
+  }
+  function redo() {
+    if (historyIndex >= history.length - 1) return;
+    historyIndex++;
+    applySnapshot(history[historyIndex]);
+  }
+
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
   window.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    // Only suppress shortcuts inside text-entry fields. Range sliders, buttons,
+    // and contenteditable need to be evaluated separately so Cmd-Z/Cmd-B keep
+    // working after the user touches the volume / quality sliders.
+    const el = e.target;
+    const tag = el && el.tagName;
+    const type = el && 'type' in el ? String(el.type).toLowerCase() : '';
+    const isTextEntry =
+      tag === 'TEXTAREA' ||
+      (tag === 'INPUT' && !['range', 'button', 'checkbox', 'radio', 'submit'].includes(type)) ||
+      (el && el.isContentEditable);
+    if (isTextEntry) return;
+    const isMeta = e.metaKey || e.ctrlKey;
     if (e.code === 'Space') {
       e.preventDefault();
       playBtn.click();
-    } else if (e.key === 'Delete' || e.key === 'Backspace') {
-      if (selectedCutIndex >= 0) {
-        e.preventDefault();
-        deleteCutBtn.click();
-      }
+    } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedSegment >= 0) {
+      e.preventDefault();
+      deleteSelectedSegment();
+    } else if (isMeta && e.code === 'KeyB') {
+      e.preventDefault();
+      makeCutAtPlayhead();
+    } else if (isMeta && e.shiftKey && e.code === 'KeyZ') {
+      e.preventDefault();
+      redo();
+    } else if (isMeta && !e.shiftKey && e.code === 'KeyZ') {
+      e.preventDefault();
+      undo();
     }
   });
 
   // ── Quality slider ────────────────────────────────────────────────────────
   function effectiveDuration() {
-    let d = trimEnd - trimStart;
-    for (const c of cuts) {
-      const overlap = Math.max(0, Math.min(c.end, trimEnd) - Math.max(c.start, trimStart));
-      d -= overlap;
+    let d = 0;
+    for (let i = 0; i < segmentDeleted.length; i++) {
+      if (!segmentDeleted[i]) d += splits[i + 1] - splits[i];
     }
     return Math.max(0.1, d);
   }
@@ -521,19 +590,26 @@
     });
   }
 
-  // Build the kept time ranges (segments).
-  function buildKeptSegments() {
-    let segs = [{ start: trimStart, end: trimEnd }];
-    for (const c of cuts) {
-      const next = [];
-      for (const s of segs) {
-        if (c.end <= s.start || c.start >= s.end) { next.push(s); continue; }
-        if (c.start > s.start) next.push({ start: s.start, end: c.start });
-        if (c.end < s.end) next.push({ start: c.end, end: s.end });
-      }
-      segs = next;
+  // Probe whether the input file has an audio stream. Returns true/false.
+  async function detectInputHasAudio(ff, inName) {
+    try {
+      await ff.exec(['-v', 'error', '-i', inName, '-map', '0:a:0', '-f', 'null', '-']);
+      return true;
+    } catch {
+      return false;
     }
-    return segs.filter((s) => s.end - s.start > 0.05);
+  }
+
+  // Build the kept time ranges by merging consecutive non-deleted segments.
+  function buildKeptSegments() {
+    const out = [];
+    let cur = null;
+    for (let i = 0; i < segmentDeleted.length; i++) {
+      if (segmentDeleted[i]) { cur = null; continue; }
+      if (!cur) { cur = { start: splits[i], end: splits[i + 1] }; out.push(cur); }
+      else cur.end = splits[i + 1];
+    }
+    return out.filter((s) => s.end - s.start > 0.05);
   }
 
   function buildFilterComplex(segs, hasAudio) {
@@ -590,7 +666,15 @@
       const srcBuf = new Uint8Array(await recording.blob.arrayBuffer());
       await ff.writeFile(inName, srcBuf);
 
-      const hasAudio = recording.hasAudio !== false;
+      // hasAudio detection: prefer the metadata flag saved with the recording,
+      // but fall back to probing the input file (legacy recordings from
+      // pre-v2.1 don't have hasAudio set).
+      let hasAudio;
+      if (recording.hasAudio == null) {
+        hasAudio = await detectInputHasAudio(ff, inName);
+      } else {
+        hasAudio = recording.hasAudio !== false;
+      }
       let filter = buildFilterComplex(segs, hasAudio);
       // If we need to scale, append a scale step after concat.
       if (plan.mode === 'cbr' && plan.scale) {
@@ -665,6 +749,26 @@
   }
 
   exportBtn.addEventListener('click', runExport);
+
+  // ── Undo / redo buttons ───────────────────────────────────────────────────
+  const undoBtn = $('undo');
+  const redoBtn = $('redo');
+  if (undoBtn) undoBtn.addEventListener('click', undo);
+  if (redoBtn) redoBtn.addEventListener('click', redo);
+
+  // ── Volume ────────────────────────────────────────────────────────────────
+  const volumeSlider = $('volume');
+  const volumeIcon = $('volume-icon');
+  function setVolume(v) {
+    v = Math.max(0, Math.min(1, v));
+    videoEl.volume = v;
+    videoEl.muted = v === 0;
+    if (volumeIcon) volumeIcon.textContent = v === 0 ? '🔇' : v < 0.5 ? '🔈' : '🔊';
+  }
+  if (volumeSlider) {
+    volumeSlider.addEventListener('input', (e) => setVolume(parseInt(e.target.value, 10) / 100));
+    setVolume(1);
+  }
 
   // ── Bootstrap ─────────────────────────────────────────────────────────────
   window.addEventListener('resize', () => { resizeCanvas(); drawTimeline(); });

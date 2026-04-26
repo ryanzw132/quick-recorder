@@ -170,6 +170,12 @@ async function acquireStreams(streamId) {
 
   // 3. Mix mic + system audio (whatever we got)
   audioCtx = new AudioContext();
+  // Hidden offscreen contexts often start AudioContext in 'suspended' state.
+  // Without explicit resume(), the destination track produces silence and the
+  // recording has no audio.
+  if (audioCtx.state === 'suspended') {
+    try { await audioCtx.resume(); } catch (e) { console.warn('[QR offscreen] AudioContext resume failed', e); }
+  }
   destNode = audioCtx.createMediaStreamDestination();
 
   if (micStream) {
