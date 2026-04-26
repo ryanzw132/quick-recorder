@@ -350,6 +350,11 @@ async function handleSW(msg, sender) {
       resetState();
       break;
     }
+    case 'notify': {
+      // Offscreen has no chrome.notifications — relay through SW.
+      notify(msg.title || 'Quick Recorder', msg.message || '');
+      break;
+    }
     case 'micPermissionMissing': {
       // Offscreen tried mic but it failed. Open the grant page once so the
       // user can grant it without hunting through chrome://settings.

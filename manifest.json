@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Quick Recorder",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "One-click screen + camera + mic recording with floating camera overlay",
   "permissions": [
     "offscreen",

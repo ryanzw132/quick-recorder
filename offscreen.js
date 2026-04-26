@@ -46,20 +46,9 @@ function send(msg) {
   chrome.runtime.sendMessage({ target: 'sw', ...msg }).catch(() => {});
 }
 
-const NOTIF_ICON = chrome.runtime.getURL('icons/icon128.png');
-
+// Offscreen documents don't have chrome.notifications — route through SW.
 function notify(title, message) {
-  try {
-    chrome.notifications.create({
-      type: 'basic',
-      iconUrl: NOTIF_ICON,
-      title,
-      message,
-      priority: 1
-    }, () => void chrome.runtime.lastError);
-  } catch (e) {
-    console.warn('[QR] notify failed', e);
-  }
+  send({ type: 'notify', title, message });
 }
 
 // Sort mics by priority: USB → Bluetooth (incl. AirPods) → built-in → other.
@@ -125,9 +114,6 @@ async function acquireStreams(streamId) {
       video: false
     });
     console.log('[QR offscreen] mic acquired (default)');
-    // Persist the grant so the SW pre-flight check passes on subsequent runs
-    // even for users who already granted via Chrome's settings.
-    chrome.storage.local.set({ micGranted: true }).catch(() => {});
 
     // Re-pick by priority once labels are populated.
     const mics = await listMics();
@@ -153,7 +139,6 @@ async function acquireStreams(streamId) {
     }
   } catch (e) {
     console.warn('[QR offscreen] mic unavailable, continuing without mic:', e?.message || e);
-    chrome.storage.local.set({ micGranted: false }).catch(() => {});
     send({ type: 'micPermissionMissing' });
     notify(
       'Recording without microphone',
@@ -458,41 +443,6 @@ async function changeMic(deviceId) {
   }
 }
 
-// Read a recording from IDB, save to disk via chrome.downloads, then optionally
-// delete. Handles its own blob URL lifecycle.
-async function downloadRecording(id, deleteAfter = true) {
-  try {
-    const rec = await QRDB.get(id);
-    if (!rec) {
-      console.warn('[QR offscreen] downloadRecording: id not found', id);
-      return;
-    }
-    const url = URL.createObjectURL(rec.blob);
-    liveBlobUrls.add(url);
-    const safeTitle = (rec.title || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 100);
-    const fallback = `Recording_${new Date(rec.createdAt).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
-    const filename = `${safeTitle || fallback}.${rec.ext || 'mp4'}`;
-    const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
-    const onChanged = (delta) => {
-      if (delta.id !== downloadId) return;
-      const s = delta.state?.current;
-      if (s !== 'complete' && s !== 'interrupted') return;
-      chrome.downloads.onChanged.removeListener(onChanged);
-      try { URL.revokeObjectURL(url); } catch {}
-      liveBlobUrls.delete(url);
-      if (deleteAfter && s === 'complete') {
-        QRDB.remove(id).catch(() => {});
-      } else if (s === 'complete') {
-        QRDB.setStatus(id, 'exported').catch(() => {});
-      }
-    };
-    chrome.downloads.onChanged.addListener(onChanged);
-  } catch (e) {
-    console.error('[QR offscreen] downloadRecording failed', e);
-    notify('Download failed', e.message || String(e));
-  }
-}
-
 function cleanup() {
   try { stopRecorder(); } catch {}
   try { stopAudioMeter(); } catch {}
@@ -508,9 +458,6 @@ function cleanup() {
   phase = 'idle';
 }
 
-// Track URLs we've created so we can revoke after download completes.
-const liveBlobUrls = new Set();
-
 // Track recording start time so onstop can compute duration.
 let recorderStartedAt = 0;
 
@@ -518,7 +465,6 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || msg.target !== 'offscreen') return false;
   switch (msg.type) {
     case 'startTabCapture': pendingTitle = msg.tabTitle || ''; start(msg.streamId, msg.tabId); break;
-    case 'downloadRecording': downloadRecording(msg.id, msg.deleteAfter !== false); break;
     case 'beginRecord': beginRecord(); break;
     case 'stop': stopRecording(); break;
     case 'retry': retry(); break;
@@ -527,11 +473,6 @@ chrome.runtime.onMessage.addListener((msg) => {
       // Toggle is only used to STOP from the SW now (start path uses
       // startTabCapture). If somehow toggled while idle, no-op.
       if (phase !== 'idle') stopRecording();
-      break;
-    }
-    case 'revokeBlob': {
-      try { URL.revokeObjectURL(msg.url); } catch {}
-      liveBlobUrls.delete(msg.url);
       break;
     }
   }
