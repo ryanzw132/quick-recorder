@@ -23,15 +23,6 @@ chrome.storage.session.get('state').then((s) => {
   if (pristine) state = { ...state, ...s.state, uiTabs: s.state.uiTabs || [] };
 });
 
-// Cached mic permission flag — set by permissions.html on grant, read by the
-// action click handler (synchronously, no await) to gate recording.
-let micGrantedFlag = false;
-chrome.storage.local.get('micGranted').then((r) => { micGrantedFlag = !!r.micGranted; });
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local') return;
-  if (changes.micGranted) micGrantedFlag = !!changes.micGranted.newValue;
-});
-
 async function hasOffscreen() {
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ['OFFSCREEN_DOCUMENT'],
@@ -150,18 +141,6 @@ chrome.action.onClicked.addListener(async (tab) => {
     notify(
       'Open a regular web page first',
       'Quick Recorder only works on regular web pages (https://...). Switch to a normal page like google.com, then click the icon.'
-    );
-    return;
-  }
-
-  // Pre-flight mic permission check. Without this, offscreen would silently
-  // fail to acquire mic and the recording would have no voice. The flag is
-  // set by permissions.html or by the offscreen on a successful mic grab.
-  if (!micGrantedFlag) {
-    chrome.tabs.create({ url: chrome.runtime.getURL('permissions.html') });
-    notify(
-      'Grant microphone access first',
-      'A page just opened — click "Grant Microphone Access" and then click Allow in the Chrome prompt. After granting, click the recorder icon again to start recording with audio.'
     );
     return;
   }
