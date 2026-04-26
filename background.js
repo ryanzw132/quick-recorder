@@ -274,9 +274,6 @@ async function handleSW(msg, sender) {
       break;
     }
     case 'openEditor': {
-      // Mark the recording as 'editing', then open the editor tab in the same
-      // Chrome window where it was recorded. If that window is gone, fall
-      // back to opening the tab in any window.
       try {
         await QRDB.setStatus(msg.recordingId, 'editing');
       } catch (e) { console.warn('[QR sw] setStatus editing failed', e); }
@@ -292,6 +289,25 @@ async function handleSW(msg, sender) {
         try { await chrome.tabs.create({ url }); }
         catch (e2) { console.error('[QR sw] open editor failed entirely', e2); }
       }
+      break;
+    }
+    case 'requestDownload': {
+      // SW reads blob from IDB, creates URL, triggers download. Doing this
+      // here (not in offscreen) avoids relying on content→offscreen messaging
+      // which is unreliable — content→SW always works.
+      await handleDownloadRecording(msg.id, msg.deleteAfter !== false);
+      break;
+    }
+    case 'stopRequest': {
+      chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop' }).catch(() => {});
+      break;
+    }
+    case 'retryRequest': {
+      chrome.runtime.sendMessage({ target: 'offscreen', type: 'retry' }).catch(() => {});
+      break;
+    }
+    case 'micChangeRequest': {
+      chrome.runtime.sendMessage({ target: 'offscreen', type: 'micChange', deviceId: msg.deviceId }).catch(() => {});
       break;
     }
     case 'recordingRestarted': {
@@ -390,5 +406,44 @@ chrome.tabs.onUpdated.addListener(async (tabId, info) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   state.uiTabs = state.uiTabs.filter((id) => id !== tabId);
   persist().catch(() => {});
+});
+
+// ── Download flow (SW-owned, doesn't depend on offscreen messaging) ──────────
+const pendingDownloads = new Map(); // downloadId -> { url, recordingId, deleteAfter }
+
+async function handleDownloadRecording(id, deleteAfter) {
+  try {
+    console.log('[QR sw] handleDownloadRecording id=', id);
+    const rec = await QRDB.get(id);
+    if (!rec) {
+      console.warn('[QR sw] downloadRecording: id not found', id);
+      notify('Download failed', 'Recording not found in storage. It may have been deleted.');
+      return;
+    }
+    const url = URL.createObjectURL(rec.blob);
+    const safe = sanitizeFilename(rec.title);
+    const fallback = `Recording_${new Date(rec.createdAt || Date.now()).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+    const filename = `${safe || fallback}.${rec.ext || 'mp4'}`;
+    const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
+    pendingDownloads.set(downloadId, { url, recordingId: id, deleteAfter });
+    console.log('[QR sw] download started, downloadId=', downloadId, 'filename=', filename);
+  } catch (e) {
+    console.error('[QR sw] download failed', e);
+    notify('Download failed', e.message || String(e));
+  }
+}
+
+chrome.downloads.onChanged.addListener((delta) => {
+  if (!pendingDownloads.has(delta.id)) return;
+  const s = delta.state?.current;
+  if (s !== 'complete' && s !== 'interrupted') return;
+  const { url, recordingId, deleteAfter } = pendingDownloads.get(delta.id);
+  pendingDownloads.delete(delta.id);
+  try { URL.revokeObjectURL(url); } catch {}
+  if (deleteAfter && s === 'complete') {
+    QRDB.remove(recordingId).catch(() => {});
+  } else if (s === 'complete') {
+    QRDB.setStatus(recordingId, 'exported').catch(() => {});
+  }
 });
 

@@ -490,10 +490,10 @@
     camBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(camMenu, micMenu); });
     micBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(micMenu, camMenu); });
     bar.querySelector('[data-qr="retry"]').addEventListener('click', () => {
-      chrome.runtime.sendMessage({ target: 'offscreen', type: 'retry' }).catch(() => {});
+      chrome.runtime.sendMessage({ target: 'sw', type: 'retryRequest' }).catch(() => {});
     });
     bar.querySelector('[data-qr="stop"]').addEventListener('click', () => {
-      chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop' }).catch(() => {});
+      chrome.runtime.sendMessage({ target: 'sw', type: 'stopRequest' }).catch(() => {});
     });
     // Close any open menu on outside click.
     document.addEventListener('mousedown', (e) => {
@@ -547,7 +547,7 @@
         mics.forEach((m) => {
           items.push(menuItem(m.label, m.id === currentMicId, () => {
             currentMicId = m.id;
-            chrome.runtime.sendMessage({ target: 'offscreen', type: 'micChange', deviceId: m.id }).catch(() => {});
+            chrome.runtime.sendMessage({ target: 'sw', type: 'micChangeRequest', deviceId: m.id }).catch(() => {});
             micMenu.hidden = true;
           }));
         });
@@ -708,12 +708,14 @@
 
     function triggerDownload() {
       if (!postrecEl) return;
+      // Route through SW (content → offscreen direct messages are unreliable
+      // for one-shot dispatch; SW relay is durable).
       chrome.runtime.sendMessage({
-        target: 'offscreen',
-        type: 'downloadRecording',
+        target: 'sw',
+        type: 'requestDownload',
         id: recordingId,
         deleteAfter: true
-      }).catch(() => {});
+      }).catch((e) => console.warn('[QR content] download dispatch failed', e));
       chrome.runtime.sendMessage({ target: 'sw', type: 'postRecordResolved' }).catch(() => {});
       dismissPostRec();
     }
