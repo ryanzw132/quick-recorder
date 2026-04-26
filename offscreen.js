@@ -168,40 +168,56 @@ async function acquireStreams(streamId) {
     );
   }
 
-  // 3. Mix mic + system audio (whatever we got)
-  audioCtx = new AudioContext();
-  // Hidden offscreen contexts often start AudioContext in 'suspended' state.
-  // Without explicit resume(), the destination track produces silence and the
-  // recording has no audio.
-  if (audioCtx.state === 'suspended') {
-    try { await audioCtx.resume(); } catch (e) { console.warn('[QR offscreen] AudioContext resume failed', e); }
-  }
-  destNode = audioCtx.createMediaStreamDestination();
-
-  if (micStream) {
-    micSrc = audioCtx.createMediaStreamSource(micStream);
-    micGain = audioCtx.createGain();
-    micGain.gain.value = 1.0;
-    micSrc.connect(micGain).connect(destNode);
-  }
-
+  // 3. Build the audio track for recording.
+  //    - If only one source (mic OR tab audio), use it raw — no AudioContext.
+  //    - If both, mix via AudioContext. If the context can't be resumed in
+  //      this hidden offscreen doc, fall back to mic-only.
   const sysTracks = screenStream.getAudioTracks();
-  if (sysTracks.length > 0) {
-    const sysOnly = new MediaStream([sysTracks[0]]);
-    sysSrc = audioCtx.createMediaStreamSource(sysOnly);
-    sysGain = audioCtx.createGain();
-    sysGain.gain.value = 1.0;
-    sysSrc.connect(sysGain).connect(destNode);
-  }
+  let audioTrack = null;
 
-  // 4. Final stream: screen video + (mixed audio iff any source exists)
-  const videoTrack = screenStream.getVideoTracks()[0];
-  const tracks = [videoTrack];
-  if (micStream || sysTracks.length > 0) {
-    tracks.push(destNode.stream.getAudioTracks()[0]);
+  if (micStream && sysTracks.length > 0) {
+    try {
+      audioCtx = new AudioContext();
+      console.log('[QR offscreen] AudioContext initial state:', audioCtx.state);
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+        console.log('[QR offscreen] AudioContext after resume:', audioCtx.state);
+      }
+      if (audioCtx.state !== 'running') {
+        throw new Error('AudioContext refused to run (state=' + audioCtx.state + ')');
+      }
+      destNode = audioCtx.createMediaStreamDestination();
+      micSrc = audioCtx.createMediaStreamSource(micStream);
+      micGain = audioCtx.createGain();
+      micGain.gain.value = 1.0;
+      micSrc.connect(micGain).connect(destNode);
+      const sysOnly = new MediaStream([sysTracks[0]]);
+      sysSrc = audioCtx.createMediaStreamSource(sysOnly);
+      sysGain = audioCtx.createGain();
+      sysGain.gain.value = 1.0;
+      sysSrc.connect(sysGain).connect(destNode);
+      audioTrack = destNode.stream.getAudioTracks()[0];
+      console.log('[QR offscreen] mixed audio via AudioContext (mic + tab)');
+    } catch (e) {
+      console.warn('[QR offscreen] AudioContext mix failed, falling back to mic-only:', e?.message || e);
+      try { audioCtx && audioCtx.close(); } catch {}
+      audioCtx = null;
+      audioTrack = micStream.getAudioTracks()[0];
+    }
+  } else if (micStream) {
+    audioTrack = micStream.getAudioTracks()[0];
+    console.log('[QR offscreen] using mic-only audio (no tab audio)');
+  } else if (sysTracks.length > 0) {
+    audioTrack = sysTracks[0];
+    console.log('[QR offscreen] using tab-audio-only (no mic)');
   } else {
     console.warn('[QR offscreen] no audio sources — recording video only');
   }
+
+  // 4. Final stream: screen video + (audio if any).
+  const videoTrack = screenStream.getVideoTracks()[0];
+  const tracks = [videoTrack];
+  if (audioTrack) tracks.push(audioTrack);
   mixedStream = new MediaStream(tracks);
 
   // If user stops sharing via the browser toolbar, finalize gracefully.
