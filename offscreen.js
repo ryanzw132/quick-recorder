@@ -109,17 +109,6 @@ async function acquireStreams(streamId) {
     }
   });
   console.log('[QR offscreen] got tab stream, audio tracks:', screenStream.getAudioTracks().length);
-  // Tab capture hijacks playback in the captured tab — re-route audio so the
-  // user can still hear what's playing.
-  try {
-    const audioTrack = screenStream.getAudioTracks()[0];
-    if (audioTrack) {
-      const sysOnly = new MediaStream([audioTrack]);
-      const playbackEl = new Audio();
-      playbackEl.srcObject = sysOnly;
-      playbackEl.play().catch(() => {});
-    }
-  } catch (e) { console.warn('[QR offscreen] passthrough audio failed', e); }
 
   // 2. Mic — OPTIONAL with priority selection. Always prefer USB → Bluetooth
   //    → built-in. Offscreen documents are hidden, so Chrome can't anchor a
@@ -136,6 +125,9 @@ async function acquireStreams(streamId) {
       video: false
     });
     console.log('[QR offscreen] mic acquired (default)');
+    // Persist the grant so the SW pre-flight check passes on subsequent runs
+    // even for users who already granted via Chrome's settings.
+    chrome.storage.local.set({ micGranted: true }).catch(() => {});
 
     // Re-pick by priority once labels are populated.
     const mics = await listMics();
@@ -161,10 +153,11 @@ async function acquireStreams(streamId) {
     }
   } catch (e) {
     console.warn('[QR offscreen] mic unavailable, continuing without mic:', e?.message || e);
+    chrome.storage.local.set({ micGranted: false }).catch(() => {});
     send({ type: 'micPermissionMissing' });
     notify(
       'Recording without microphone',
-      'Microphone permission has not been granted to the extension. Opening the permissions page so you can fix it for next time.'
+      'Mic permission was revoked or never granted. Opening the permissions page now — grant it, then start a new recording.'
     );
   }
 
@@ -316,6 +309,10 @@ function startAudioMeter() {
   const audioTrack = mixedStream.getAudioTracks()[0];
   if (!audioTrack) {
     console.log('[QR offscreen] no audio track — meter disabled');
+    notify(
+      'Recording will be silent',
+      'No audio source captured. Make sure mic is granted (click the recorder icon, you should see a permissions page) or that the tab you\'re recording is playing audio.'
+    );
     return;
   }
   try {
@@ -328,6 +325,8 @@ function startAudioMeter() {
     src.connect(analyser);
     const buf = new Float32Array(analyser.fftSize);
     audioMeterCtx = meterCtx;
+    let silentSeconds = 0;
+    let warned = false;
     audioMeterInterval = setInterval(() => {
       analyser.getFloatTimeDomainData(buf);
       let sum = 0;
@@ -335,6 +334,17 @@ function startAudioMeter() {
       const rms = Math.sqrt(sum / buf.length);
       const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
       console.log('[QR offscreen] audio level (RMS):', rms.toFixed(4), 'dBFS:', dbfs.toFixed(1));
+      // Detect prolonged silence so the user gets a clear warning instead of
+      // a silent recording.
+      if (dbfs < -55) silentSeconds++;
+      else silentSeconds = 0;
+      if (!warned && silentSeconds >= 4) {
+        warned = true;
+        notify(
+          'No audio detected',
+          'The recording has been silent for 4 seconds. Check that your mic isn\'t muted at the OS level (System Settings → Privacy → Microphone) and that the tab you\'re recording is playing audio.'
+        );
+      }
     }, 1000);
   } catch (e) {
     console.warn('[QR offscreen] audio meter failed', e);
