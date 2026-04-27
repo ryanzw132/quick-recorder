@@ -165,6 +165,19 @@ chrome.action.onClicked.addListener(async (tab) => {
     streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
   } catch (e) {
     console.error('[QR sw] tabCapture failed', e);
+    // Recovery: a prior failed attempt left a stale capture on this tab.
+    // Close the offscreen doc to release any held streams and ask user to click again.
+    if (/active stream/i.test(e?.message || '')) {
+      if (await hasOffscreen()) {
+        try { await chrome.offscreen.closeDocument(); } catch (e2) { console.warn('[QR sw] closeDocument failed', e2); }
+      }
+      resetState();
+      notify(
+        'Cleared a stuck recording',
+        'A previous session left a capture attached to this tab. Click the recorder icon again to start fresh.'
+      );
+      return;
+    }
     notify('Cannot start recording', 'Tab capture failed: ' + (e.message || e));
     return;
   }
@@ -435,36 +448,27 @@ const pendingDownloads = new Map(); // downloadId -> { url, recordingId, deleteA
 
 async function handleDownloadRecording(id, deleteAfter) {
   console.log('[QR sw] handleDownloadRecording id=', id, 'deleteAfter=', deleteAfter);
-  let rec;
+  // MV3 service workers don't have URL.createObjectURL. Ask the offscreen
+  // doc (which has a Window context) to read IDB and produce a blob URL.
+  await ensureOffscreen();
+  let resp;
   try {
-    rec = await QRDB.get(id);
+    resp = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'prepareBlobUrl', id });
   } catch (e) {
-    console.error('[QR sw] QRDB.get threw', e);
-    notify('Download failed', 'Could not read recording from storage: ' + (e.message || e));
+    console.error('[QR sw] prepareBlobUrl message failed', e);
+    notify('Download failed', 'Could not reach offscreen: ' + (e.message || e));
     return;
   }
-  if (!rec) {
-    console.warn('[QR sw] downloadRecording: id not found', id);
-    notify('Download failed', 'Recording not found in storage. It may have been deleted.');
+  if (!resp || !resp.ok) {
+    console.error('[QR sw] prepareBlobUrl returned error:', resp);
+    notify('Download failed', resp?.error || 'Unknown error preparing download');
     return;
   }
-  if (!rec.blob || !rec.blob.size) {
-    console.error('[QR sw] recording blob is empty', rec);
-    notify('Download failed', 'Recording is empty (0 bytes).');
-    return;
-  }
-  let url;
-  try {
-    url = URL.createObjectURL(rec.blob);
-  } catch (e) {
-    console.error('[QR sw] URL.createObjectURL threw', e);
-    notify('Download failed', 'Could not create blob URL: ' + (e.message || e));
-    return;
-  }
-  const safe = sanitizeFilename(rec.title);
-  const fallback = `Recording_${new Date(rec.createdAt || Date.now()).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
-  const filename = `${safe || fallback}.${rec.ext || 'mp4'}`;
-  console.log('[QR sw] requesting chrome.downloads.download, filename=', filename, 'size=', rec.blob.size);
+  const { url, ext, title, createdAt } = resp;
+  const safe = sanitizeFilename(title);
+  const fallback = `Recording_${new Date(createdAt || Date.now()).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+  const filename = `${safe || fallback}.${ext || 'mp4'}`;
+  console.log('[QR sw] chrome.downloads.download filename=', filename);
   try {
     const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
     if (downloadId === undefined) {
@@ -474,7 +478,7 @@ async function handleDownloadRecording(id, deleteAfter) {
     console.log('[QR sw] download started, downloadId=', downloadId);
   } catch (e) {
     console.error('[QR sw] chrome.downloads.download threw', e);
-    try { URL.revokeObjectURL(url); } catch {}
+    chrome.runtime.sendMessage({ target: 'offscreen', type: 'revokeBlob', url }).catch(() => {});
     notify('Download failed', e.message || String(e));
   }
 }
@@ -485,7 +489,8 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (s !== 'complete' && s !== 'interrupted') return;
   const { url, recordingId, deleteAfter } = pendingDownloads.get(delta.id);
   pendingDownloads.delete(delta.id);
-  try { URL.revokeObjectURL(url); } catch {}
+  // Blob URL was created in the offscreen doc — revoke there.
+  chrome.runtime.sendMessage({ target: 'offscreen', type: 'revokeBlob', url }).catch(() => {});
   if (deleteAfter && s === 'complete') {
     QRDB.remove(recordingId).catch(() => {});
   } else if (s === 'complete') {

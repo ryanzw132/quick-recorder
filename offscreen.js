@@ -461,19 +461,51 @@ function cleanup() {
 // Track recording start time so onstop can compute duration.
 let recorderStartedAt = 0;
 
-chrome.runtime.onMessage.addListener((msg) => {
+// Live blob URLs — kept so SW can ask us to revoke after a download finishes.
+const liveBlobUrls = new Set();
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.target !== 'offscreen') return false;
   switch (msg.type) {
-    case 'startTabCapture': pendingTitle = msg.tabTitle || ''; start(msg.streamId, msg.tabId); break;
-    case 'beginRecord': beginRecord(); break;
-    case 'stop': stopRecording(); break;
-    case 'retry': retry(); break;
-    case 'micChange': changeMic(msg.deviceId); break;
+    case 'startTabCapture': pendingTitle = msg.tabTitle || ''; start(msg.streamId, msg.tabId); return false;
+    case 'beginRecord': beginRecord(); return false;
+    case 'stop': stopRecording(); return false;
+    case 'retry': retry(); return false;
+    case 'micChange': changeMic(msg.deviceId); return false;
     case 'toggle': {
-      // Toggle is only used to STOP from the SW now (start path uses
-      // startTabCapture). If somehow toggled while idle, no-op.
       if (phase !== 'idle') stopRecording();
-      break;
+      return false;
+    }
+    case 'prepareBlobUrl': {
+      // SW can't call URL.createObjectURL in MV3; do it here and send the URL
+      // back. Same-origin blob URLs work across all extension contexts.
+      (async () => {
+        try {
+          const rec = await QRDB.get(msg.id);
+          if (!rec) { sendResponse({ ok: false, error: 'Recording not found in IDB' }); return; }
+          if (!rec.blob || !rec.blob.size) { sendResponse({ ok: false, error: 'Recording blob is empty' }); return; }
+          const url = URL.createObjectURL(rec.blob);
+          liveBlobUrls.add(url);
+          sendResponse({
+            ok: true, url,
+            mime: rec.mime, ext: rec.ext, title: rec.title, createdAt: rec.createdAt
+          });
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message || String(e) });
+        }
+      })();
+      return true; // keep channel open for async sendResponse
+    }
+    case 'revokeBlob': {
+      try { URL.revokeObjectURL(msg.url); } catch {}
+      liveBlobUrls.delete(msg.url);
+      return false;
+    }
+    case 'forceCleanup': {
+      // SW asks us to release any held streams (e.g. after a "tab already
+      // captured" error from a stale prior attempt).
+      cleanup();
+      return false;
     }
   }
   return false;
