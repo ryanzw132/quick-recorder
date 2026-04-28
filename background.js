@@ -444,7 +444,41 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 // ── Download flow (SW-owned, doesn't depend on offscreen messaging) ──────────
-const pendingDownloads = new Map(); // downloadId -> { url, recordingId, deleteAfter }
+// In-memory + persisted mirror of pending downloads. The SW can be suspended
+// between chrome.downloads.download() and onChanged firing complete; if that
+// happens, the in-memory map is empty when the listener wakes up. We keep a
+// copy in chrome.storage.session keyed by downloadId so it survives.
+const pendingDownloads = new Map(); // downloadId -> { url, recordingId, deleteAfter, tag }
+const PENDING_DL_KEY = 'qr_pending_downloads';
+
+async function persistPendingDownload(downloadId, entry) {
+  pendingDownloads.set(downloadId, entry);
+  try {
+    const r = await chrome.storage.session.get(PENDING_DL_KEY);
+    const map = r[PENDING_DL_KEY] || {};
+    map[String(downloadId)] = entry;
+    await chrome.storage.session.set({ [PENDING_DL_KEY]: map });
+  } catch (e) { console.warn('[QR sw] persistPendingDownload failed', e); }
+}
+
+async function getPendingDownload(downloadId) {
+  if (pendingDownloads.has(downloadId)) return pendingDownloads.get(downloadId);
+  try {
+    const r = await chrome.storage.session.get(PENDING_DL_KEY);
+    const map = r[PENDING_DL_KEY] || {};
+    return map[String(downloadId)] || null;
+  } catch (e) { return null; }
+}
+
+async function clearPendingDownload(downloadId) {
+  pendingDownloads.delete(downloadId);
+  try {
+    const r = await chrome.storage.session.get(PENDING_DL_KEY);
+    const map = r[PENDING_DL_KEY] || {};
+    delete map[String(downloadId)];
+    await chrome.storage.session.set({ [PENDING_DL_KEY]: map });
+  } catch (e) { console.warn('[QR sw] clearPendingDownload failed', e); }
+}
 
 async function handleDownloadRecording(id, deleteAfter, tag) {
   console.log('[QR sw] handleDownloadRecording id=', id, 'deleteAfter=', deleteAfter, 'tag=', tag);
@@ -474,7 +508,7 @@ async function handleDownloadRecording(id, deleteAfter, tag) {
     if (downloadId === undefined) {
       throw new Error(chrome.runtime.lastError?.message || 'chrome.downloads.download returned no id');
     }
-    pendingDownloads.set(downloadId, { url, recordingId: id, deleteAfter, tag });
+    await persistPendingDownload(downloadId, { url, recordingId: id, deleteAfter, tag });
     console.log('[QR sw] download started, downloadId=', downloadId);
   } catch (e) {
     console.error('[QR sw] chrome.downloads.download threw', e);
@@ -484,19 +518,18 @@ async function handleDownloadRecording(id, deleteAfter, tag) {
 }
 
 chrome.downloads.onChanged.addListener(async (delta) => {
-  if (!pendingDownloads.has(delta.id)) return;
   const s = delta.state?.current;
   if (s !== 'complete' && s !== 'interrupted') return;
-  const { url, recordingId, deleteAfter, tag } = pendingDownloads.get(delta.id);
-  pendingDownloads.delete(delta.id);
+  const entry = await getPendingDownload(delta.id);
+  if (!entry) return;
+  const { url, recordingId, deleteAfter, tag } = entry;
+  await clearPendingDownload(delta.id);
   // Blob URL was created in the offscreen doc — revoke there.
   chrome.runtime.sendMessage({ target: 'offscreen', type: 'revokeBlob', url }).catch(() => {});
   if (s === 'complete') {
     if (tag && tag.name) {
-      // Apply macOS Finder tag via native messaging host.
       try {
-        const items = await chrome.downloads.search({ id: delta.id });
-        const path = items?.[0]?.filename;
+        const path = await resolveDownloadPath(delta.id);
         if (path) await applyFinderTag(path, tag);
         else console.warn('[QR sw] could not resolve filename for download', delta.id);
       } catch (e) {
@@ -508,14 +541,31 @@ chrome.downloads.onChanged.addListener(async (delta) => {
   }
 });
 
+// chrome.downloads.search occasionally returns an empty filename right at the
+// moment a download flips to complete — the file move is in flight. Retry up
+// to 5 times over ~1.5s before giving up.
+async function resolveDownloadPath(downloadId) {
+  for (let i = 0; i < 5; i++) {
+    try {
+      const items = await chrome.downloads.search({ id: downloadId });
+      const path = items?.[0]?.filename;
+      if (path) return path;
+    } catch (e) { console.warn('[QR sw] downloads.search threw', e); }
+    await new Promise((r) => setTimeout(r, 200 + i * 100));
+  }
+  return null;
+}
+
 // ── macOS Finder tag via Native Messaging ────────────────────────────────────
 const NATIVE_HOST = 'com.quickrecorder.tagger';
 let nativeHostMissingNotified = false;
 
 async function applyFinderTag(path, tag) {
   // Tag spec format that the `tag` CLI accepts: "name" or "name\n<color>"
-  // where color is a digit 0-7. macOS stores it as a binary plist xattr.
-  const colorOk = Number.isInteger(tag.color) && tag.color >= 0 && tag.color <= 7;
+  // where color is a digit 1..7 (1=grey, 2=green, 3=purple, 4=blue, 5=yellow,
+  // 6=red, 7=orange). The CLI rejects 0, so omit the suffix entirely if the
+  // caller passed 0 / undefined / null.
+  const colorOk = Number.isInteger(tag.color) && tag.color >= 1 && tag.color <= 7;
   const spec = colorOk ? `${tag.name}\n${tag.color}` : tag.name;
   console.log('[QR sw] applyFinderTag path=', path, 'spec=', JSON.stringify(spec));
   try {

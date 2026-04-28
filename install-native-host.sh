@@ -30,10 +30,22 @@ if [[ -z "$EXT_ID" ]]; then
   exit 1
 fi
 
-# Sanity-check the ID format (32 lowercase a-p chars).
+# Sanity-check the ID format (32 lowercase a-p chars). A wrong ID means Chrome
+# refuses to launch the helper at runtime ("not allowed") with no clear error
+# in the user's face — bail loudly here unless --force is passed.
+FORCE=0
+for arg in "$@"; do
+  if [[ "$arg" == "--force" ]]; then FORCE=1; fi
+done
 if ! [[ "$EXT_ID" =~ ^[a-p]{32}$ ]]; then
-  echo "WARNING: '$EXT_ID' doesn't look like a Chrome extension ID (expected 32 lowercase a-p chars)."
-  echo "Continuing anyway, but if tagging doesn't work, double-check the ID."
+  if [[ "$FORCE" -ne 1 ]]; then
+    echo "ERROR: '$EXT_ID' is not a valid Chrome extension ID." >&2
+    echo "Expected 32 lowercase letters a-p (e.g. 'fjajhhaahdmgiefegoknbmafbbgkaimm')." >&2
+    echo "Find the right ID at chrome://extensions (toggle Developer mode)." >&2
+    echo "If you really want to install with this ID, re-run with --force." >&2
+    exit 1
+  fi
+  echo "WARNING: '$EXT_ID' is not a typical extension ID. --force given, continuing."
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

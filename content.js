@@ -265,10 +265,12 @@
   `;
 
   // ── Tags ──────────────────────────────────────────────────────────────────
-  // macOS Finder tag color codes: 0=grey, 2=green, 3=purple, 4=blue, 5=yellow,
-  // 6=red, 7=orange. Hardcoded for v0.4 — settings UI to customize is future.
+  // macOS Finder tag color codes (per jdberry/tag source):
+  //   1=grey, 2=green, 3=purple, 4=blue, 5=yellow, 6=red, 7=orange.
+  // Color 0 means "no color" — the tag CLI rejects \n0, so we send the name
+  // with no \n<digit> suffix in the SW (see background.js applyFinderTag).
   const TAG_COLORS = {
-    0: '#9aa0a6', 2: '#5fcc5d', 3: '#c479db', 4: '#3478f6',
+    1: '#9aa0a6', 2: '#5fcc5d', 3: '#c479db', 4: '#3478f6',
     5: '#f7d046', 6: '#ff5e5e', 7: '#f6953d'
   };
   const DEFAULT_TAGS = [
@@ -281,7 +283,7 @@
     { name: 'Tutorial',   color: 5 },
     { name: 'Meeting',    color: 4 },
     { name: 'Review',     color: 5 },
-    { name: 'Draft',      color: 0 },
+    { name: 'Draft',      color: 1 },
     { name: 'Done',       color: 2 },
     { name: 'Followup',   color: 7 },
     { name: 'Reference',  color: 3 },
@@ -291,7 +293,7 @@
     { name: 'Internal',   color: 3 },
     { name: 'Customer',   color: 6 },
     { name: 'Onboarding', color: 2 },
-    { name: 'Quick',      color: 0 }
+    { name: 'Quick',      color: 1 }
   ];
 
   function defaultCam() {
@@ -761,7 +763,7 @@
       if (postrecTimer) { clearInterval(postrecTimer); postrecTimer = null; }
       postrecEl.classList.add('qr-tag-view');
       const tagsHtml = DEFAULT_TAGS.map((t, i) => {
-        const dotColor = TAG_COLORS[t.color] || TAG_COLORS[0];
+        const dotColor = TAG_COLORS[t.color] || TAG_COLORS[1];
         return `<button class="qr-tag-btn" data-qr="tag" data-idx="${i}" title="${esc(t.name)}">
           <span class="qr-tag-dot" style="background:${dotColor}"></span>
           <span>${esc(t.name)}</span>
