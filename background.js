@@ -325,7 +325,7 @@ async function handleSW(msg, sender) {
       // SW reads blob from IDB, creates URL, triggers download. Doing this
       // here (not in offscreen) avoids relying on content→offscreen messaging
       // which is unreliable — content→SW always works.
-      await handleDownloadRecording(msg.id, msg.deleteAfter !== false);
+      await handleDownloadRecording(msg.id, msg.deleteAfter !== false, msg.tag || null);
       break;
     }
     case 'stopRequest': {
@@ -446,8 +446,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // ── Download flow (SW-owned, doesn't depend on offscreen messaging) ──────────
 const pendingDownloads = new Map(); // downloadId -> { url, recordingId, deleteAfter }
 
-async function handleDownloadRecording(id, deleteAfter) {
-  console.log('[QR sw] handleDownloadRecording id=', id, 'deleteAfter=', deleteAfter);
+async function handleDownloadRecording(id, deleteAfter, tag) {
+  console.log('[QR sw] handleDownloadRecording id=', id, 'deleteAfter=', deleteAfter, 'tag=', tag);
   // MV3 service workers don't have URL.createObjectURL. Ask the offscreen
   // doc (which has a Window context) to read IDB and produce a blob URL.
   await ensureOffscreen();
@@ -474,7 +474,7 @@ async function handleDownloadRecording(id, deleteAfter) {
     if (downloadId === undefined) {
       throw new Error(chrome.runtime.lastError?.message || 'chrome.downloads.download returned no id');
     }
-    pendingDownloads.set(downloadId, { url, recordingId: id, deleteAfter });
+    pendingDownloads.set(downloadId, { url, recordingId: id, deleteAfter, tag });
     console.log('[QR sw] download started, downloadId=', downloadId);
   } catch (e) {
     console.error('[QR sw] chrome.downloads.download threw', e);
@@ -483,18 +483,65 @@ async function handleDownloadRecording(id, deleteAfter) {
   }
 }
 
-chrome.downloads.onChanged.addListener((delta) => {
+chrome.downloads.onChanged.addListener(async (delta) => {
   if (!pendingDownloads.has(delta.id)) return;
   const s = delta.state?.current;
   if (s !== 'complete' && s !== 'interrupted') return;
-  const { url, recordingId, deleteAfter } = pendingDownloads.get(delta.id);
+  const { url, recordingId, deleteAfter, tag } = pendingDownloads.get(delta.id);
   pendingDownloads.delete(delta.id);
   // Blob URL was created in the offscreen doc — revoke there.
   chrome.runtime.sendMessage({ target: 'offscreen', type: 'revokeBlob', url }).catch(() => {});
-  if (deleteAfter && s === 'complete') {
-    QRDB.remove(recordingId).catch(() => {});
-  } else if (s === 'complete') {
-    QRDB.setStatus(recordingId, 'exported').catch(() => {});
+  if (s === 'complete') {
+    if (tag && tag.name) {
+      // Apply macOS Finder tag via native messaging host.
+      try {
+        const items = await chrome.downloads.search({ id: delta.id });
+        const path = items?.[0]?.filename;
+        if (path) await applyFinderTag(path, tag);
+        else console.warn('[QR sw] could not resolve filename for download', delta.id);
+      } catch (e) {
+        console.warn('[QR sw] applyFinderTag flow failed', e);
+      }
+    }
+    if (deleteAfter) QRDB.remove(recordingId).catch(() => {});
+    else QRDB.setStatus(recordingId, 'exported').catch(() => {});
   }
 });
+
+// ── macOS Finder tag via Native Messaging ────────────────────────────────────
+const NATIVE_HOST = 'com.quickrecorder.tagger';
+let nativeHostMissingNotified = false;
+
+async function applyFinderTag(path, tag) {
+  // Tag spec format that the `tag` CLI accepts: "name" or "name\n<color>"
+  // where color is a digit 0-7. macOS stores it as a binary plist xattr.
+  const colorOk = Number.isInteger(tag.color) && tag.color >= 0 && tag.color <= 7;
+  const spec = colorOk ? `${tag.name}\n${tag.color}` : tag.name;
+  console.log('[QR sw] applyFinderTag path=', path, 'spec=', JSON.stringify(spec));
+  try {
+    const resp = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { path, tag: spec });
+    if (resp && resp.ok) {
+      console.log('[QR sw] tag applied');
+    } else {
+      console.warn('[QR sw] native host returned error:', resp);
+      notify('Tag not applied', resp?.error || 'Native helper returned an error.');
+    }
+  } catch (e) {
+    const msg = String(e?.message || e);
+    console.warn('[QR sw] sendNativeMessage failed:', msg);
+    if (/host not found|not registered|not allowed/i.test(msg)) {
+      // First-run nudge to install the helper. Show only once per SW lifetime
+      // so we don't spam after every download.
+      if (!nativeHostMissingNotified) {
+        nativeHostMissingNotified = true;
+        notify(
+          'Finder tagging not set up',
+          "Run install-native-host.sh once (see README). The file downloaded fine without a tag."
+        );
+      }
+    } else {
+      notify('Tag not applied', msg);
+    }
+  }
+}
 

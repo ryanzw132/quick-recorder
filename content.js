@@ -230,7 +230,69 @@
       transform-origin: left center;
       transition: transform 200ms linear;
     }
+
+    /* Tag picker (second view of post-record popup) */
+    .qr-postrec.qr-tag-view { min-width: 360px; }
+    .qr-tag-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      margin: 4px 0;
+    }
+    .qr-tag-btn {
+      display: flex !important; align-items: center; gap: 6px;
+      padding: 8px 10px !important;
+      background: rgba(255,255,255,0.08) !important;
+      border: none !important;
+      border-radius: 8px !important;
+      color: white !important;
+      font-size: 12px !important;
+      cursor: pointer !important;
+      text-align: left;
+      transition: background 100ms;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .qr-tag-btn:hover { background: rgba(255,255,255,0.18) !important; }
+    .qr-tag-btn:active { background: rgba(255,255,255,0.28) !important; }
+    .qr-tag-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15);
+    }
   `;
+
+  // ── Tags ──────────────────────────────────────────────────────────────────
+  // macOS Finder tag color codes: 0=grey, 2=green, 3=purple, 4=blue, 5=yellow,
+  // 6=red, 7=orange. Hardcoded for v0.4 — settings UI to customize is future.
+  const TAG_COLORS = {
+    0: '#9aa0a6', 2: '#5fcc5d', 3: '#c479db', 4: '#3478f6',
+    5: '#f7d046', 6: '#ff5e5e', 7: '#f6953d'
+  };
+  const DEFAULT_TAGS = [
+    { name: 'Work',       color: 4 },
+    { name: 'Personal',   color: 3 },
+    { name: 'Important',  color: 6 },
+    { name: 'Idea',       color: 5 },
+    { name: 'Bug',        color: 6 },
+    { name: 'Demo',       color: 2 },
+    { name: 'Tutorial',   color: 5 },
+    { name: 'Meeting',    color: 4 },
+    { name: 'Review',     color: 5 },
+    { name: 'Draft',      color: 0 },
+    { name: 'Done',       color: 2 },
+    { name: 'Followup',   color: 7 },
+    { name: 'Reference',  color: 3 },
+    { name: 'Snippet',    color: 2 },
+    { name: 'Sales',      color: 7 },
+    { name: 'Pitch',      color: 4 },
+    { name: 'Internal',   color: 3 },
+    { name: 'Customer',   color: 6 },
+    { name: 'Onboarding', color: 2 },
+    { name: 'Quick',      color: 0 }
+  ];
 
   function defaultCam() {
     // Top-right by default — avoids overlap with Chrome's permission prompt
@@ -658,44 +720,80 @@
     ensureHost();
     postrecEl = document.createElement('div');
     postrecEl.className = 'qr-postrec';
-    postrecEl.innerHTML = `
-      <div class="qr-postrec-title">Recording saved</div>
-      <div class="qr-postrec-sub">Auto-downloads in <span data-qr="countdown">30</span>s.</div>
-      <div class="qr-postrec-buttons">
-        <button class="qr-postrec-btn primary" data-qr="download">⬇ Download</button>
-        <button class="qr-postrec-btn secondary" data-qr="edit">✂ Edit</button>
-      </div>
-      <div class="qr-postrec-progress"><div class="qr-postrec-progress-fill" data-qr="bar"></div></div>
-    `;
     shadow.appendChild(postrecEl);
-    const countdownEl = postrecEl.querySelector('[data-qr="countdown"]');
-    const barEl = postrecEl.querySelector('[data-qr="bar"]');
-    const total = 30000;
-    const startedAt = Date.now();
-    const tick = () => {
-      const elapsed = Date.now() - startedAt;
-      const remain = Math.max(0, total - elapsed);
-      countdownEl.textContent = Math.ceil(remain / 1000);
-      barEl.style.transform = `scaleX(${remain / total})`;
-      if (remain <= 0) {
-        triggerDownload();
-      }
-    };
-    tick();
-    postrecTimer = setInterval(tick, 200);
+    renderInitialView();
 
-    postrecEl.querySelector('[data-qr="download"]').addEventListener('click', triggerDownload);
-    postrecEl.querySelector('[data-qr="edit"]').addEventListener('click', triggerEdit);
+    // ── View 1: Recording saved + Download / Edit + 30s auto-download ──────
+    function renderInitialView() {
+      if (postrecTimer) { clearInterval(postrecTimer); postrecTimer = null; }
+      postrecEl.classList.remove('qr-tag-view');
+      postrecEl.innerHTML = `
+        <div class="qr-postrec-title">Recording saved</div>
+        <div class="qr-postrec-sub">Auto-downloads in <span data-qr="countdown">30</span>s.</div>
+        <div class="qr-postrec-buttons">
+          <button class="qr-postrec-btn primary" data-qr="download">⬇ Download</button>
+          <button class="qr-postrec-btn secondary" data-qr="edit">✂ Edit</button>
+        </div>
+        <div class="qr-postrec-progress"><div class="qr-postrec-progress-fill" data-qr="bar"></div></div>
+      `;
+      const countdownEl = postrecEl.querySelector('[data-qr="countdown"]');
+      const barEl = postrecEl.querySelector('[data-qr="bar"]');
+      const total = 30000;
+      const startedAt = Date.now();
+      const tick = () => {
+        const elapsed = Date.now() - startedAt;
+        const remain = Math.max(0, total - elapsed);
+        countdownEl.textContent = Math.ceil(remain / 1000);
+        barEl.style.transform = `scaleX(${remain / total})`;
+        if (remain <= 0) {
+          // Auto-download with no tag if user lets countdown expire.
+          triggerDownload(null);
+        }
+      };
+      tick();
+      postrecTimer = setInterval(tick, 200);
+      postrecEl.querySelector('[data-qr="download"]').addEventListener('click', renderTagView);
+      postrecEl.querySelector('[data-qr="edit"]').addEventListener('click', triggerEdit);
+    }
 
-    function triggerDownload() {
+    // ── View 2: Tag picker — click a tag to download with that Finder tag ──
+    function renderTagView() {
+      if (postrecTimer) { clearInterval(postrecTimer); postrecTimer = null; }
+      postrecEl.classList.add('qr-tag-view');
+      const tagsHtml = DEFAULT_TAGS.map((t, i) => {
+        const dotColor = TAG_COLORS[t.color] || TAG_COLORS[0];
+        return `<button class="qr-tag-btn" data-qr="tag" data-idx="${i}" title="${esc(t.name)}">
+          <span class="qr-tag-dot" style="background:${dotColor}"></span>
+          <span>${esc(t.name)}</span>
+        </button>`;
+      }).join('');
+      postrecEl.innerHTML = `
+        <div class="qr-postrec-title">Tag &amp; download</div>
+        <div class="qr-postrec-sub">Pick a tag — file gets the matching Finder tag.</div>
+        <div class="qr-tag-grid">${tagsHtml}</div>
+        <div class="qr-postrec-buttons">
+          <button class="qr-postrec-btn secondary" data-qr="back">← Back</button>
+          <button class="qr-postrec-btn secondary" data-qr="no-tag">Download (no tag)</button>
+        </div>
+      `;
+      postrecEl.querySelectorAll('[data-qr="tag"]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = Number(btn.getAttribute('data-idx'));
+          triggerDownload(DEFAULT_TAGS[idx]);
+        });
+      });
+      postrecEl.querySelector('[data-qr="back"]').addEventListener('click', renderInitialView);
+      postrecEl.querySelector('[data-qr="no-tag"]').addEventListener('click', () => triggerDownload(null));
+    }
+
+    function triggerDownload(tag) {
       if (!postrecEl) return;
-      // Route through SW (content → offscreen direct messages are unreliable
-      // for one-shot dispatch; SW relay is durable).
       chrome.runtime.sendMessage({
         target: 'sw',
         type: 'requestDownload',
         id: recordingId,
-        deleteAfter: true
+        deleteAfter: true,
+        tag: tag || null
       }).catch((e) => console.warn('[QR content] download dispatch failed', e));
       chrome.runtime.sendMessage({ target: 'sw', type: 'postRecordResolved' }).catch(() => {});
       dismissPostRec();

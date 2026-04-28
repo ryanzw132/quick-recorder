@@ -24,6 +24,20 @@ No screen picker, no setup once installed. Click the icon, get a 3-second countd
 5. Pin the extension (puzzle icon → pin Quick Recorder).
 6. A tab will open asking you to grant microphone permission. Click **Grant Microphone Access** → **Allow**. The tab closes itself.
 
+### Optional: Finder tag downloads (macOS only)
+
+When you stop a recording, click **Download** to open a tag picker — pick a tag and the file is saved with that macOS Finder tag attached (the same tags you see colored in Finder). To enable this, run the one-time install:
+
+1. From `chrome://extensions`, toggle Developer mode and copy the **ID** under "Quick Recorder" (32 lowercase letters).
+2. In Terminal, from this repo:
+   ```sh
+   ./install-native-host.sh <your-extension-id>
+   ```
+   This installs Homebrew's `tag` CLI if needed, drops the helper at `~/.quick-recorder/qr-tagger.py`, and registers the Chrome native messaging host.
+3. Reload the extension at `chrome://extensions` → done.
+
+If you skip this, downloads still work — the tag is just silently not applied.
+
 ## Use
 
 1. Open the page you want to record (must be a regular `http(s)` page — not `chrome://`, not the Web Store, not the PDF viewer).
@@ -60,6 +74,7 @@ No screen picker, no setup once installed. Click the icon, get a 3-second countd
 - `downloads` — to save the MP4.
 - `storage` — to remember the camera bubble's position and size.
 - `notifications` — for error messages (mic permission missing, etc.).
+- `nativeMessaging` — to talk to the optional `qr-tagger.py` helper for applying macOS Finder tags. Only used if you ran the install script.
 - `host_permissions: <all_urls>` — needed because the floating UI is injected into whatever tab you're recording.
 
 ## Built with help from
