@@ -274,26 +274,24 @@
     5: '#f7d046', 6: '#ff5e5e', 7: '#f6953d'
   };
   const DEFAULT_TAGS = [
-    { name: 'Work',       color: 4 },
-    { name: 'Personal',   color: 3 },
-    { name: 'Important',  color: 6 },
-    { name: 'Idea',       color: 5 },
-    { name: 'Bug',        color: 6 },
-    { name: 'Demo',       color: 2 },
-    { name: 'Tutorial',   color: 5 },
-    { name: 'Meeting',    color: 4 },
-    { name: 'Review',     color: 5 },
-    { name: 'Draft',      color: 1 },
-    { name: 'Done',       color: 2 },
-    { name: 'Followup',   color: 7 },
-    { name: 'Reference',  color: 3 },
-    { name: 'Snippet',    color: 2 },
-    { name: 'Sales',      color: 7 },
-    { name: 'Pitch',      color: 4 },
-    { name: 'Internal',   color: 3 },
-    { name: 'Customer',   color: 6 },
-    { name: 'Onboarding', color: 2 },
-    { name: 'Quick',      color: 1 }
+    { name: 'Testimonials',    color: 5 },
+    { name: 'VSL',             color: 4 },
+    { name: 'Description',     color: 3 },
+    { name: 'Value Stack',     color: 2 },
+    { name: 'CTA',             color: 6 },
+    { name: 'Cover',           color: 4 },
+    { name: 'FAQ',             color: 3 },
+    { name: 'Images',          color: 5 },
+    { name: 'Branding',        color: 3 },
+    { name: 'About Owner',     color: 4 },
+    { name: 'Pricing',         color: 2 },
+    { name: 'Lead Magnet',     color: 7 },
+    { name: 'Inside Video',    color: 4 },
+    { name: 'Graphics',        color: 5 },
+    { name: 'Content CTAs',    color: 6 },
+    { name: 'Posting Cadence', color: 7 },
+    { name: 'Content Match',   color: 2 },
+    { name: 'Dead Social',     color: 1 }
   ];
 
   function defaultCam() {
