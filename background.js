@@ -526,10 +526,18 @@ chrome.downloads.onChanged.addListener(async (delta) => {
     if (tag && tag.name) {
       try {
         const path = await resolveDownloadPath(delta.id);
-        if (path) await applyFinderTag(path, tag);
-        else console.warn('[QR sw] could not resolve filename for download', delta.id);
+        if (path) {
+          await applyFinderTag(path, tag);
+        } else {
+          console.warn('[QR sw] could not resolve filename for download', delta.id);
+          notify(
+            'Tag not applied',
+            `Downloaded the file but couldn't resolve its path to apply "${tag.name}". Check the file and add the tag manually if needed.`
+          );
+        }
       } catch (e) {
         console.warn('[QR sw] applyFinderTag flow failed', e);
+        notify('Tag not applied', `Download completed but tagging "${tag.name}" failed: ${e?.message || e}`);
       }
     }
     if (deleteAfter) QRDB.remove(recordingId).catch(() => {});
