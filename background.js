@@ -447,36 +447,32 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // In-memory + persisted mirror of pending downloads. The SW can be suspended
 // between chrome.downloads.download() and onChanged firing complete; if that
 // happens, the in-memory map is empty when the listener wakes up. We keep a
-// copy in chrome.storage.session keyed by downloadId so it survives.
+// per-downloadId entry in chrome.storage.session so it survives. Per-key
+// writes are atomic — avoids the read-modify-write race that a shared map
+// object would have under concurrent downloads.
 const pendingDownloads = new Map(); // downloadId -> { url, recordingId, deleteAfter, tag }
-const PENDING_DL_KEY = 'qr_pending_downloads';
+const PENDING_DL_PREFIX = 'qr_pending_dl_';
+const pendingKey = (id) => PENDING_DL_PREFIX + id;
 
 async function persistPendingDownload(downloadId, entry) {
   pendingDownloads.set(downloadId, entry);
   try {
-    const r = await chrome.storage.session.get(PENDING_DL_KEY);
-    const map = r[PENDING_DL_KEY] || {};
-    map[String(downloadId)] = entry;
-    await chrome.storage.session.set({ [PENDING_DL_KEY]: map });
+    await chrome.storage.session.set({ [pendingKey(downloadId)]: entry });
   } catch (e) { console.warn('[QR sw] persistPendingDownload failed', e); }
 }
 
 async function getPendingDownload(downloadId) {
   if (pendingDownloads.has(downloadId)) return pendingDownloads.get(downloadId);
   try {
-    const r = await chrome.storage.session.get(PENDING_DL_KEY);
-    const map = r[PENDING_DL_KEY] || {};
-    return map[String(downloadId)] || null;
+    const r = await chrome.storage.session.get(pendingKey(downloadId));
+    return r[pendingKey(downloadId)] || null;
   } catch (e) { return null; }
 }
 
 async function clearPendingDownload(downloadId) {
   pendingDownloads.delete(downloadId);
   try {
-    const r = await chrome.storage.session.get(PENDING_DL_KEY);
-    const map = r[PENDING_DL_KEY] || {};
-    delete map[String(downloadId)];
-    await chrome.storage.session.set({ [PENDING_DL_KEY]: map });
+    await chrome.storage.session.remove(pendingKey(downloadId));
   } catch (e) { console.warn('[QR sw] clearPendingDownload failed', e); }
 }
 
