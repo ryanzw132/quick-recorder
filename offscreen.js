@@ -75,51 +75,24 @@ async function listMics() {
   }
 }
 
-// Verify a mic track is actually producing audio. Looks at track.muted,
-// readyState, and runs a brief 250ms RMS sample. Returns true if the track
-// is healthy enough to record with.
+// Verify a mic track is healthy enough to record with. Checks track.muted
+// and readyState — gives the track up to 500ms to clear an initial muted
+// state (Bluetooth devices can start momentarily muted while the link comes
+// up). We DO NOT do RMS sampling: a legitimately quiet room produces near-
+// zero samples on a working mic, and that would false-negative reject it
+// while a noisy device (AirPods hiss) would always pass. The audio meter
+// running during recording catches actual silence over time.
 async function verifyMicTrackHealthy(track) {
   if (!track) return false;
-  if (track.readyState !== 'live' || track.muted) return false;
-  // Wait one tick for the track to start producing audio (AirPods especially
-  // need a moment after acquisition).
-  return await new Promise((resolve) => {
-    let ctx;
-    try {
-      ctx = new AudioContext();
-      const stream = new MediaStream([track]);
-      const src = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      src.connect(analyser);
-      const buf = new Float32Array(analyser.fftSize);
-      let nonZero = 0;
-      const tick = () => {
-        if (track.readyState !== 'live' || track.muted) return cleanup(false);
-        analyser.getFloatTimeDomainData(buf);
-        // Any non-zero sample means the track is producing data. We don't
-        // need actual speech — even line noise counts as "the link is alive".
-        for (let i = 0; i < buf.length; i++) {
-          if (buf[i] !== 0) { nonZero++; break; }
-        }
-        // Resolve early ONLY on positive — Bluetooth devices (especially
-        // AirPods) can take 200-500ms after acquisition to start sampling.
-        if (nonZero > 0) return cleanup(true);
-        requestAnimationFrame(tick);
-      };
-      const timeout = setTimeout(() => cleanup(nonZero > 0), 800);
-      const cleanup = (ok) => {
-        clearTimeout(timeout);
-        try { ctx.close(); } catch {}
-        resolve(ok);
-      };
-      tick();
-    } catch (e) {
-      console.warn('[QR offscreen] verifyMicTrackHealthy failed', e);
-      try { ctx && ctx.close(); } catch {}
-      resolve(true); // fail-open: don't block recording on a verifier crash
-    }
-  });
+  if (track.readyState !== 'live') return false;
+  if (track.muted) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 500);
+      const onUnmute = () => { clearTimeout(timer); resolve(); };
+      track.addEventListener('unmute', onUnmute, { once: true });
+    });
+  }
+  return track.readyState === 'live' && !track.muted;
 }
 
 // Wire up mic-track lifecycle events. If the mic mutes (Bluetooth flap, OS
@@ -164,25 +137,32 @@ function attachAudioContextRecovery(ctx) {
 }
 
 // Notify content (and SW) when the mic device list changes so the bar menu
-// can refresh.
+// can refresh. macOS fires devicechange in bursts (5+ times in 200ms when
+// AirPods connect) — debounce so we only emit once per actual change.
 let deviceChangeListenerAttached = false;
+let deviceChangeDebounce = null;
 function attachDeviceChangeListener() {
   if (deviceChangeListenerAttached) return;
   deviceChangeListenerAttached = true;
-  navigator.mediaDevices.addEventListener('devicechange', async () => {
-    console.log('[QR offscreen] devicechange fired — refreshing mic list');
-    try {
-      const mics = await listMics();
-      send({ type: 'micsChanged', mics });
-    } catch (e) { console.warn('[QR offscreen] listMics on devicechange failed', e); }
+  navigator.mediaDevices.addEventListener('devicechange', () => {
+    if (deviceChangeDebounce) clearTimeout(deviceChangeDebounce);
+    deviceChangeDebounce = setTimeout(async () => {
+      console.log('[QR offscreen] devicechange (debounced) — refreshing mic list');
+      try {
+        const mics = await listMics();
+        send({ type: 'micsChanged', mics });
+      } catch (e) { console.warn('[QR offscreen] listMics on devicechange failed', e); }
+    }, 250);
   });
 }
 
-// Robust mic acquisition: tries the default device, then iterates priority
-// candidates if default is unhealthy. Returns a verified MediaStream or null.
-// "Healthy" = readyState=='live', !muted, and produces non-zero samples within
-// ~800ms (so AirPods/Bluetooth get time to start the link).
+// Robust mic acquisition. Trusts the OS-level default — if the user picked
+// a mic in System Settings (or Chrome's site settings), we use it. Only when
+// the default is genuinely broken (NotFoundError, muted track, etc.) do we
+// fall back to other devices. Returns a verified MediaStream or null.
 async function acquireMicWithVerification() {
+  let permissionDenied = false;
+
   const tryDevice = async (deviceId) => {
     try {
       const constraints = {
@@ -202,21 +182,26 @@ async function acquireMicWithVerification() {
       stream.getTracks().forEach((t) => t.stop());
       return null;
     } catch (e) {
-      console.warn('[QR offscreen] mic acquisition failed:', deviceId || '(default)', e?.message || e);
+      // NotAllowedError = permission denied (or revoked). Distinguish from
+      // hardware/device errors (NotFoundError, OverconstrainedError, etc.)
+      // because the recovery action for the user is different.
+      if (e?.name === 'NotAllowedError') permissionDenied = true;
+      console.warn('[QR offscreen] mic acquisition failed:', deviceId || '(default)', e?.name, e?.message || e);
       return null;
     }
   };
 
-  // 1. Try the default mic first. If healthy, we're done.
-  let stream = null;
-  try {
-    stream = await tryDevice(null);
-    if (stream) {
-      console.log('[QR offscreen] mic acquired (default), label:', stream.getAudioTracks()[0]?.label);
-    }
-  } catch (e) {
-    // getUserMedia threw before tryDevice could catch — most likely permission denied.
-    console.warn('[QR offscreen] default mic getUserMedia threw:', e?.message || e);
+  // 1. Try the OS-level default. The user has already expressed intent here
+  //    via System Settings or Chrome's input device picker — respect it.
+  let stream = await tryDevice(null);
+  if (stream) {
+    console.log('[QR offscreen] mic acquired (default), label:', stream.getAudioTracks()[0]?.label);
+    return stream;
+  }
+
+  // 2. Default failed. If it was a permission denial, we can't recover by
+  //    trying another device — every getUserMedia call will fail the same way.
+  if (permissionDenied) {
     send({ type: 'micPermissionMissing' });
     notify(
       'Recording without microphone',
@@ -225,37 +210,26 @@ async function acquireMicWithVerification() {
     return null;
   }
 
-  // 2. Re-pick by priority. We do this whether the default was healthy or
-  //    not: if a higher-priority device exists AND verifies, prefer it.
-  //    If default was unhealthy, this is also our fallback path.
+  // 3. Default device is broken (muted, busy, just-disconnected). Try other
+  //    devices in priority order until one verifies healthy.
+  console.warn('[QR offscreen] default mic unhealthy — trying alternatives');
   const mics = await listMics();
-  const currentTrack = stream && stream.getAudioTracks()[0];
-  const currentId = currentTrack?.getSettings?.().deviceId;
-
   for (const candidate of mics) {
-    if (stream && candidate.id === currentId) break; // current is already top priority
-    if (!stream || micPriorityRank(candidate.label) <= micPriorityRank(currentTrack?.label || '')) {
-      console.log('[QR offscreen] trying mic:', candidate.label);
-      const better = await tryDevice(candidate.id);
-      if (better) {
-        if (stream) stream.getTracks().forEach((t) => t.stop());
-        stream = better;
-        console.log('[QR offscreen] using mic:', candidate.label);
-        break;
-      }
+    console.log('[QR offscreen] trying fallback mic:', candidate.label);
+    const better = await tryDevice(candidate.id);
+    if (better) {
+      console.log('[QR offscreen] using fallback mic:', candidate.label);
+      return better;
     }
   }
 
-  // 3. If we still have no working mic, surface the failure.
-  if (!stream) {
-    console.warn('[QR offscreen] no healthy mic — recording without mic');
-    send({ type: 'micPermissionMissing' });
-    notify(
-      'Microphone unavailable',
-      "Couldn't get a working mic — every device tried was muted or silent (Bluetooth flap, OS-level mute, or just-disconnected hardware). Recording continues with tab audio only. Fix the mic and click ↻ Retry to start over."
-    );
-  }
-  return stream;
+  // 4. Nothing worked. Could be hardware issue, all devices muted, etc.
+  console.warn('[QR offscreen] no healthy mic available');
+  notify(
+    'Microphone unavailable',
+    "Couldn't get a working mic — every device tried was muted or silent. Common causes: System Settings → Privacy → Microphone is blocked, the device is busy in another app, or a Bluetooth device just disconnected. Recording continues without voice. Fix the mic and click ↻ Retry."
+  );
+  return null;
 }
 
 async function acquireStreams(streamId) {
@@ -569,11 +543,17 @@ function stopRecording() {
   stopRecorder();
 }
 
+let retryInFlight = false;
 async function retry() {
   // Re-acquire the MIC and rebuild the audio graph, then start a fresh
   // recorder. This is the recovery path for a dead/muted mic — without
   // re-acquisition, retry would just record silence again.
+  if (retryInFlight) {
+    console.log('[QR offscreen] retry() ignored — already in flight');
+    return;
+  }
   if (!recorder && phase !== 'recording' && phase !== 'awaiting-begin') return;
+  retryInFlight = true;
   console.log('[QR offscreen] retry() — re-acquiring mic');
   const old = recorder;
   recorder = null; // detach handlers' "save" branch
@@ -641,6 +621,7 @@ async function retry() {
     notify('Retry failed', 'Screen capture was lost. Click the recorder icon again to start fresh.');
     send({ type: 'error', error: 'Retry failed: no screen stream.' });
     cleanup();
+    retryInFlight = false;
     return;
   }
   const tracks = [videoTrack];
@@ -649,6 +630,7 @@ async function retry() {
 
   startRecorder();
   send({ type: 'recordingRestarted' });
+  retryInFlight = false;
 }
 
 async function changeMic(deviceId) {
