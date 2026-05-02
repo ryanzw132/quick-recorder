@@ -75,6 +75,113 @@ async function listMics() {
   }
 }
 
+// Verify a mic track is actually producing audio. Looks at track.muted,
+// readyState, and runs a brief 250ms RMS sample. Returns true if the track
+// is healthy enough to record with.
+async function verifyMicTrackHealthy(track) {
+  if (!track) return false;
+  if (track.readyState !== 'live' || track.muted) return false;
+  // Wait one tick for the track to start producing audio (AirPods especially
+  // need a moment after acquisition).
+  return await new Promise((resolve) => {
+    let ctx;
+    try {
+      ctx = new AudioContext();
+      const stream = new MediaStream([track]);
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      src.connect(analyser);
+      const buf = new Float32Array(analyser.fftSize);
+      let samples = 0;
+      let nonZero = 0;
+      const tick = () => {
+        if (track.readyState !== 'live' || track.muted) {
+          cleanup(false);
+          return;
+        }
+        analyser.getFloatTimeDomainData(buf);
+        // Any non-zero sample means the track is producing data. We don't
+        // need actual speech — even line noise counts as "the link is alive".
+        for (let i = 0; i < buf.length; i++) {
+          if (buf[i] !== 0) { nonZero++; break; }
+        }
+        samples++;
+        if (samples >= 5) cleanup(nonZero > 0);
+        else requestAnimationFrame(tick);
+      };
+      // Bail out if the track never produces samples.
+      const timeout = setTimeout(() => cleanup(nonZero > 0), 600);
+      const cleanup = (ok) => {
+        clearTimeout(timeout);
+        try { ctx.close(); } catch {}
+        resolve(ok);
+      };
+      tick();
+    } catch (e) {
+      console.warn('[QR offscreen] verifyMicTrackHealthy failed', e);
+      try { ctx && ctx.close(); } catch {}
+      resolve(true); // fail-open: don't block recording on a verifier crash
+    }
+  });
+}
+
+// Wire up mic-track lifecycle events. If the mic mutes (Bluetooth flap, OS
+// suspend) or ends mid-recording, surface a notification so the user knows
+// the recording will be silent until they recover the device.
+function attachMicTrackLifecycleHandlers(stream) {
+  if (!stream) return;
+  const t = stream.getAudioTracks()[0];
+  if (!t) return;
+  t.addEventListener('mute', () => {
+    console.warn('[QR offscreen] mic track MUTED (track.id=' + t.id + ')');
+    notify(
+      'Microphone went silent',
+      "Your mic just muted itself — usually a Bluetooth disconnect or sleep transition. The recording is still rolling but won't have voice until you fix it. Click ↻ Retry on the bar after fixing."
+    );
+  });
+  t.addEventListener('unmute', () => {
+    console.log('[QR offscreen] mic track UNMUTED (track.id=' + t.id + ')');
+  });
+  t.addEventListener('ended', () => {
+    console.warn('[QR offscreen] mic track ENDED (track.id=' + t.id + ')');
+    notify(
+      'Microphone disconnected',
+      "Your mic was disconnected mid-recording. The rest of the recording will be silent. Click ↻ Retry on the bar to start over with a working mic."
+    );
+  });
+}
+
+// AudioContext suspends after macOS sleep/wake. Resume it automatically.
+function attachAudioContextRecovery(ctx) {
+  if (!ctx) return;
+  ctx.addEventListener('statechange', () => {
+    console.log('[QR offscreen] AudioContext state:', ctx.state);
+    if (ctx.state === 'suspended') {
+      ctx.resume().then(() => {
+        console.log('[QR offscreen] AudioContext resumed automatically');
+      }).catch((e) => {
+        console.warn('[QR offscreen] AudioContext resume failed', e);
+      });
+    }
+  });
+}
+
+// Notify content (and SW) when the mic device list changes so the bar menu
+// can refresh.
+let deviceChangeListenerAttached = false;
+function attachDeviceChangeListener() {
+  if (deviceChangeListenerAttached) return;
+  deviceChangeListenerAttached = true;
+  navigator.mediaDevices.addEventListener('devicechange', async () => {
+    console.log('[QR offscreen] devicechange fired — refreshing mic list');
+    try {
+      const mics = await listMics();
+      send({ type: 'micsChanged', mics });
+    } catch (e) { console.warn('[QR offscreen] listMics on devicechange failed', e); }
+  });
+}
+
 async function acquireStreams(streamId) {
   // 1. Tab capture (no picker). Both video and audio of the captured tab are
   //    requested via the chromium-specific `chromeMediaSource: 'tab'` form.
@@ -115,13 +222,16 @@ async function acquireStreams(streamId) {
     });
     console.log('[QR offscreen] mic acquired (default)');
 
-    // Re-pick by priority once labels are populated.
+    // Re-pick by priority once labels are populated. Verify the new track
+    // actually produces audio before swapping in (Bluetooth devices like
+    // AirPods can return a "live" but immediately-muted track when the link
+    // is flapping; that would cause a silent recording).
     const mics = await listMics();
     const top = mics[0];
     const currentTrack = micStream.getAudioTracks()[0];
     const currentId = currentTrack?.getSettings?.().deviceId;
     if (top && top.id !== currentId) {
-      console.log('[QR offscreen] switching to higher-priority mic:', top.label);
+      console.log('[QR offscreen] trying higher-priority mic:', top.label);
       try {
         const better = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -131,12 +241,21 @@ async function acquireStreams(streamId) {
             autoGainControl: false
           }
         });
-        micStream.getTracks().forEach((t) => t.stop());
-        micStream = better;
+        const betterTrack = better.getAudioTracks()[0];
+        const ok = await verifyMicTrackHealthy(betterTrack);
+        if (ok) {
+          micStream.getTracks().forEach((t) => t.stop());
+          micStream = better;
+          console.log('[QR offscreen] switched to', top.label);
+        } else {
+          console.warn('[QR offscreen] higher-priority mic unhealthy (muted/silent), keeping default');
+          better.getTracks().forEach((t) => t.stop());
+        }
       } catch (e) {
         console.warn('[QR offscreen] priority mic unavailable, keeping default:', e?.message || e);
       }
     }
+    attachMicTrackLifecycleHandlers(micStream);
   } catch (e) {
     console.warn('[QR offscreen] mic unavailable, continuing without mic:', e?.message || e);
     send({ type: 'micPermissionMissing' });
@@ -156,6 +275,7 @@ async function acquireStreams(streamId) {
   if (micStream && sysTracks.length > 0) {
     try {
       audioCtx = new AudioContext();
+      attachAudioContextRecovery(audioCtx);
       console.log('[QR offscreen] AudioContext initial state:', audioCtx.state);
       if (audioCtx.state === 'suspended') {
         await audioCtx.resume();
@@ -291,8 +411,7 @@ function startRecorder() {
 
 function startAudioMeter() {
   stopAudioMeter();
-  const audioTrack = mixedStream.getAudioTracks()[0];
-  if (!audioTrack) {
+  if (!mixedStream || mixedStream.getAudioTracks().length === 0) {
     console.log('[QR offscreen] no audio track — meter disabled');
     notify(
       'Recording will be silent',
@@ -300,46 +419,75 @@ function startAudioMeter() {
     );
     return;
   }
+  // CRITICAL: meter the MIC TRACK directly, not the mixed output. If we metered
+  // the mixed track, tab audio could mask a dead mic — the meter would show
+  // healthy levels while the mic produced silence. Splitting the meters means
+  // we can tell the user "your mic specifically went dead" vs "everything is
+  // silent". When there's no mic, we fall back to metering the final track.
   try {
-    const meterCtx = new AudioContext();
-    if (meterCtx.state === 'suspended') meterCtx.resume().catch(() => {});
-    const meterStream = new MediaStream([audioTrack]);
-    const src = meterCtx.createMediaStreamSource(meterStream);
-    const analyser = meterCtx.createAnalyser();
-    analyser.fftSize = 1024;
-    src.connect(analyser);
-    const buf = new Float32Array(analyser.fftSize);
-    audioMeterCtx = meterCtx;
-    let silentSeconds = 0;
-    let warned = false;
-    audioMeterInterval = setInterval(() => {
-      analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-      const rms = Math.sqrt(sum / buf.length);
-      const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
-      console.log('[QR offscreen] audio level (RMS):', rms.toFixed(4), 'dBFS:', dbfs.toFixed(1));
-      // Detect prolonged silence so the user gets a clear warning instead of
-      // a silent recording.
-      if (dbfs < -55) silentSeconds++;
-      else silentSeconds = 0;
-      if (!warned && silentSeconds >= 4) {
-        warned = true;
-        notify(
-          'No audio detected',
-          'The recording has been silent for 4 seconds. Check that your mic isn\'t muted at the OS level (System Settings → Privacy → Microphone) and that the tab you\'re recording is playing audio.'
-        );
-      }
-    }, 1000);
+    audioMeterCtx = new AudioContext();
+    if (audioMeterCtx.state === 'suspended') audioMeterCtx.resume().catch(() => {});
+
+    const startWatcher = (track, label, dbfsThreshold = -55, silentSecondsBeforeWarn = 6) => {
+      if (!track) return null;
+      const analyser = audioMeterCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      const src = audioMeterCtx.createMediaStreamSource(new MediaStream([track]));
+      src.connect(analyser);
+      const buf = new Float32Array(analyser.fftSize);
+      let silentSeconds = 0;
+      let warned = false;
+      return setInterval(() => {
+        // If track went away, stop quietly — lifecycle handler will warn user.
+        if (track.readyState !== 'live') return;
+        if (track.muted) {
+          // Don't double-warn here — the mute event handler already did.
+          silentSeconds = 0; // reset so we don't fire AGAIN when it unmutes
+          return;
+        }
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+        const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+        console.log(`[QR offscreen] ${label} RMS=${rms.toFixed(4)} dBFS=${dbfs.toFixed(1)}`);
+        if (dbfs < dbfsThreshold) silentSeconds++;
+        else silentSeconds = 0;
+        if (!warned && silentSeconds >= silentSecondsBeforeWarn) {
+          warned = true;
+          if (label === 'mic') {
+            notify(
+              'Mic appears silent',
+              `The mic has been silent for ${silentSecondsBeforeWarn}s. If you're talking, your mic may be muted at the OS level (System Settings → Privacy → Microphone) or routed to the wrong device. Click ↻ Retry on the bar to re-acquire.`
+            );
+          } else {
+            notify(
+              'No audio detected',
+              `The recording has been silent for ${silentSecondsBeforeWarn}s. Check that the tab you're recording is playing audio and your mic isn't muted.`
+            );
+          }
+        }
+      }, 1000);
+    };
+
+    const micTrack = micStream && micStream.getAudioTracks()[0];
+    if (micTrack) {
+      audioMeterMicInterval = startWatcher(micTrack, 'mic');
+    } else {
+      // No mic; meter the final track so we still catch silent recordings.
+      audioMeterFinalInterval = startWatcher(mixedStream.getAudioTracks()[0], 'final');
+    }
   } catch (e) {
     console.warn('[QR offscreen] audio meter failed', e);
   }
 }
 
 let audioMeterCtx = null;
-let audioMeterInterval = null;
+let audioMeterMicInterval = null;
+let audioMeterFinalInterval = null;
 function stopAudioMeter() {
-  if (audioMeterInterval) { clearInterval(audioMeterInterval); audioMeterInterval = null; }
+  if (audioMeterMicInterval) { clearInterval(audioMeterMicInterval); audioMeterMicInterval = null; }
+  if (audioMeterFinalInterval) { clearInterval(audioMeterFinalInterval); audioMeterFinalInterval = null; }
   if (audioMeterCtx) { try { audioMeterCtx.close(); } catch {} audioMeterCtx = null; }
 }
 
@@ -357,6 +505,7 @@ async function start(streamId, tabId) {
   phase = 'starting';
   const myGen = ++startGen;
   console.log('[QR offscreen] start() phase=starting gen=' + myGen);
+  attachDeviceChangeListener();
   try {
     await acquireStreams(streamId);
     if (phase !== 'starting' || startGen !== myGen) { cleanup(); return; }
@@ -414,7 +563,10 @@ function retry() {
 }
 
 async function changeMic(deviceId) {
-  if (!audioCtx || !destNode) return;
+  if (!audioCtx || !destNode) {
+    notify('Mic switch unavailable', "This recording started without a mic in the audio mixer. Click ↻ Retry on the bar to start over and pick this mic from the start.");
+    return;
+  }
   try {
     const newStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -424,12 +576,17 @@ async function changeMic(deviceId) {
         autoGainControl: false
       }
     });
+    const newTrack = newStream.getAudioTracks()[0];
+    const ok = await verifyMicTrackHealthy(newTrack);
+    if (!ok) {
+      newStream.getTracks().forEach((t) => t.stop());
+      notify('Mic switch failed', 'The selected mic returned silence (Bluetooth flap or device busy). Keeping the previous mic.');
+      return;
+    }
     // Disconnect old source
     if (micSrc) { try { micSrc.disconnect(); } catch {} }
     if (micStream) micStream.getTracks().forEach((t) => t.stop());
     micStream = newStream;
-    // micGain may not exist if the original mic acquisition failed — create
-    // the audio graph node lazily on first successful mic.
     if (!micGain) {
       micGain = audioCtx.createGain();
       micGain.gain.value = 1.0;
@@ -437,6 +594,9 @@ async function changeMic(deviceId) {
     }
     micSrc = audioCtx.createMediaStreamSource(micStream);
     micSrc.connect(micGain);
+    attachMicTrackLifecycleHandlers(micStream);
+    // Restart meter so we're now watching the new mic.
+    startAudioMeter();
   } catch (e) {
     console.warn('[QR offscreen] mic switch failed', e);
     notify('Mic switch failed', e.message || String(e));

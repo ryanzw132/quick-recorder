@@ -369,6 +369,9 @@
       await new Promise((r) => setTimeout(r, 900));
     }
     wrap.remove();
+    // Let the removal paint and clear from the capture pipeline before recording starts;
+    // otherwise the tail of "1" intermittently leaks into the first frames.
+    await new Promise((r) => setTimeout(r, 500));
   }
 
   // ── Camera ────────────────────────────────────────────────────────────────
