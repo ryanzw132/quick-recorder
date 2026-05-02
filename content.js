@@ -822,6 +822,9 @@
       case 'restarted': onRestarted(msg); break;
       case 'cleanup': teardown(); dismissPostRec(); break;
       case 'showPostRecord': showPostRecord(msg.recordingId, msg.windowId); break;
+      case 'micsChanged':
+        if (Array.isArray(msg.mics)) { mics = msg.mics; updateBarSelects(); }
+        break;
     }
     return false;
   });

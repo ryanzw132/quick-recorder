@@ -93,25 +93,21 @@ async function verifyMicTrackHealthy(track) {
       analyser.fftSize = 1024;
       src.connect(analyser);
       const buf = new Float32Array(analyser.fftSize);
-      let samples = 0;
       let nonZero = 0;
       const tick = () => {
-        if (track.readyState !== 'live' || track.muted) {
-          cleanup(false);
-          return;
-        }
+        if (track.readyState !== 'live' || track.muted) return cleanup(false);
         analyser.getFloatTimeDomainData(buf);
         // Any non-zero sample means the track is producing data. We don't
         // need actual speech — even line noise counts as "the link is alive".
         for (let i = 0; i < buf.length; i++) {
           if (buf[i] !== 0) { nonZero++; break; }
         }
-        samples++;
-        if (samples >= 5) cleanup(nonZero > 0);
-        else requestAnimationFrame(tick);
+        // Resolve early ONLY on positive — Bluetooth devices (especially
+        // AirPods) can take 200-500ms after acquisition to start sampling.
+        if (nonZero > 0) return cleanup(true);
+        requestAnimationFrame(tick);
       };
-      // Bail out if the track never produces samples.
-      const timeout = setTimeout(() => cleanup(nonZero > 0), 600);
+      const timeout = setTimeout(() => cleanup(nonZero > 0), 800);
       const cleanup = (ok) => {
         clearTimeout(timeout);
         try { ctx.close(); } catch {}
@@ -182,6 +178,86 @@ function attachDeviceChangeListener() {
   });
 }
 
+// Robust mic acquisition: tries the default device, then iterates priority
+// candidates if default is unhealthy. Returns a verified MediaStream or null.
+// "Healthy" = readyState=='live', !muted, and produces non-zero samples within
+// ~800ms (so AirPods/Bluetooth get time to start the link).
+async function acquireMicWithVerification() {
+  const tryDevice = async (deviceId) => {
+    try {
+      const constraints = {
+        audio: {
+          ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false
+        },
+        video: false
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const track = stream.getAudioTracks()[0];
+      const ok = await verifyMicTrackHealthy(track);
+      if (ok) return stream;
+      console.warn('[QR offscreen] mic unhealthy:', deviceId || '(default)', 'label:', track?.label);
+      stream.getTracks().forEach((t) => t.stop());
+      return null;
+    } catch (e) {
+      console.warn('[QR offscreen] mic acquisition failed:', deviceId || '(default)', e?.message || e);
+      return null;
+    }
+  };
+
+  // 1. Try the default mic first. If healthy, we're done.
+  let stream = null;
+  try {
+    stream = await tryDevice(null);
+    if (stream) {
+      console.log('[QR offscreen] mic acquired (default), label:', stream.getAudioTracks()[0]?.label);
+    }
+  } catch (e) {
+    // getUserMedia threw before tryDevice could catch — most likely permission denied.
+    console.warn('[QR offscreen] default mic getUserMedia threw:', e?.message || e);
+    send({ type: 'micPermissionMissing' });
+    notify(
+      'Recording without microphone',
+      'Mic permission was revoked or never granted. Opening the permissions page now — grant it, then start a new recording.'
+    );
+    return null;
+  }
+
+  // 2. Re-pick by priority. We do this whether the default was healthy or
+  //    not: if a higher-priority device exists AND verifies, prefer it.
+  //    If default was unhealthy, this is also our fallback path.
+  const mics = await listMics();
+  const currentTrack = stream && stream.getAudioTracks()[0];
+  const currentId = currentTrack?.getSettings?.().deviceId;
+
+  for (const candidate of mics) {
+    if (stream && candidate.id === currentId) break; // current is already top priority
+    if (!stream || micPriorityRank(candidate.label) <= micPriorityRank(currentTrack?.label || '')) {
+      console.log('[QR offscreen] trying mic:', candidate.label);
+      const better = await tryDevice(candidate.id);
+      if (better) {
+        if (stream) stream.getTracks().forEach((t) => t.stop());
+        stream = better;
+        console.log('[QR offscreen] using mic:', candidate.label);
+        break;
+      }
+    }
+  }
+
+  // 3. If we still have no working mic, surface the failure.
+  if (!stream) {
+    console.warn('[QR offscreen] no healthy mic — recording without mic');
+    send({ type: 'micPermissionMissing' });
+    notify(
+      'Microphone unavailable',
+      "Couldn't get a working mic — every device tried was muted or silent (Bluetooth flap, OS-level mute, or just-disconnected hardware). Recording continues with tab audio only. Fix the mic and click ↻ Retry to start over."
+    );
+  }
+  return stream;
+}
+
 async function acquireStreams(streamId) {
   // 1. Tab capture (no picker). Both video and audio of the captured tab are
   //    requested via the chromium-specific `chromeMediaSource: 'tab'` form.
@@ -209,61 +285,8 @@ async function acquireStreams(streamId) {
   // 2. Mic — OPTIONAL with priority selection. Always prefer USB → Bluetooth
   //    → built-in. Offscreen documents are hidden, so Chrome can't anchor a
   //    permission prompt to them; if not pre-granted, we record without mic.
-  micStream = null;
-  try {
-    // First permission check / grant
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: false
-      },
-      video: false
-    });
-    console.log('[QR offscreen] mic acquired (default)');
-
-    // Re-pick by priority once labels are populated. Verify the new track
-    // actually produces audio before swapping in (Bluetooth devices like
-    // AirPods can return a "live" but immediately-muted track when the link
-    // is flapping; that would cause a silent recording).
-    const mics = await listMics();
-    const top = mics[0];
-    const currentTrack = micStream.getAudioTracks()[0];
-    const currentId = currentTrack?.getSettings?.().deviceId;
-    if (top && top.id !== currentId) {
-      console.log('[QR offscreen] trying higher-priority mic:', top.label);
-      try {
-        const better = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            deviceId: { exact: top.id },
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: false
-          }
-        });
-        const betterTrack = better.getAudioTracks()[0];
-        const ok = await verifyMicTrackHealthy(betterTrack);
-        if (ok) {
-          micStream.getTracks().forEach((t) => t.stop());
-          micStream = better;
-          console.log('[QR offscreen] switched to', top.label);
-        } else {
-          console.warn('[QR offscreen] higher-priority mic unhealthy (muted/silent), keeping default');
-          better.getTracks().forEach((t) => t.stop());
-        }
-      } catch (e) {
-        console.warn('[QR offscreen] priority mic unavailable, keeping default:', e?.message || e);
-      }
-    }
-    attachMicTrackLifecycleHandlers(micStream);
-  } catch (e) {
-    console.warn('[QR offscreen] mic unavailable, continuing without mic:', e?.message || e);
-    send({ type: 'micPermissionMissing' });
-    notify(
-      'Recording without microphone',
-      'Mic permission was revoked or never granted. Opening the permissions page now — grant it, then start a new recording.'
-    );
-  }
+  micStream = await acquireMicWithVerification();
+  if (micStream) attachMicTrackLifecycleHandlers(micStream);
 
   // 3. Build the audio track for recording.
   //    - If only one source (mic OR tab audio), use it raw — no AudioContext.
@@ -546,18 +569,84 @@ function stopRecording() {
   stopRecorder();
 }
 
-function retry() {
-  // Discard current chunks, stop recorder without firing onstop's "save" path,
-  // then start a new recorder over the same streams.
-  if (!recorder) return;
+async function retry() {
+  // Re-acquire the MIC and rebuild the audio graph, then start a fresh
+  // recorder. This is the recovery path for a dead/muted mic — without
+  // re-acquisition, retry would just record silence again.
+  if (!recorder && phase !== 'recording' && phase !== 'awaiting-begin') return;
+  console.log('[QR offscreen] retry() — re-acquiring mic');
   const old = recorder;
   recorder = null; // detach handlers' "save" branch
-  old.onstop = null;
-  old.ondataavailable = null;
-  old.onerror = null;
-  try { old.stop(); } catch {}
+  if (old) {
+    old.onstop = null;
+    old.ondataavailable = null;
+    old.onerror = null;
+    try { old.stop(); } catch {}
+  }
   chunks = [];
-  // Start a fresh recorder
+  stopAudioMeter();
+
+  // Tear down the old mic-side of the audio graph (keep tab audio + screen
+  // video — those are still valid).
+  if (micSrc) { try { micSrc.disconnect(); } catch {} }
+  if (micStream) micStream.getTracks().forEach((t) => t.stop());
+  micStream = null;
+  micSrc = null;
+
+  // Re-acquire mic with health verification. May return null if all mics fail.
+  const newMicStream = await acquireMicWithVerification();
+  if (newMicStream) attachMicTrackLifecycleHandlers(newMicStream);
+  micStream = newMicStream;
+
+  // Rebuild audio track. If we have an audioCtx (mixed mode), reattach the
+  // new mic source to the existing destNode. Otherwise rebuild mixedStream
+  // from raw tracks.
+  const sysTracks = screenStream ? screenStream.getAudioTracks() : [];
+  let audioTrack = null;
+  if (audioCtx && destNode && micStream) {
+    if (!micGain) {
+      micGain = audioCtx.createGain();
+      micGain.gain.value = 1.0;
+      micGain.connect(destNode);
+    }
+    micSrc = audioCtx.createMediaStreamSource(micStream);
+    micSrc.connect(micGain);
+    audioTrack = destNode.stream.getAudioTracks()[0];
+  } else if (micStream && sysTracks.length > 0) {
+    // No prior mixer — build one now so both sources end up in the recording.
+    try {
+      audioCtx = new AudioContext();
+      attachAudioContextRecovery(audioCtx);
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      destNode = audioCtx.createMediaStreamDestination();
+      micGain = audioCtx.createGain(); micGain.gain.value = 1.0; micGain.connect(destNode);
+      micSrc = audioCtx.createMediaStreamSource(micStream); micSrc.connect(micGain);
+      const sysOnly = new MediaStream([sysTracks[0]]);
+      sysSrc = audioCtx.createMediaStreamSource(sysOnly);
+      sysGain = audioCtx.createGain(); sysGain.gain.value = 1.0;
+      sysSrc.connect(sysGain).connect(destNode);
+      audioTrack = destNode.stream.getAudioTracks()[0];
+    } catch (e) {
+      console.warn('[QR offscreen] retry: AudioContext rebuild failed, mic-only', e);
+      audioTrack = micStream.getAudioTracks()[0];
+    }
+  } else if (micStream) {
+    audioTrack = micStream.getAudioTracks()[0];
+  } else if (sysTracks.length > 0) {
+    audioTrack = sysTracks[0];
+  }
+
+  const videoTrack = screenStream ? screenStream.getVideoTracks()[0] : null;
+  if (!videoTrack) {
+    notify('Retry failed', 'Screen capture was lost. Click the recorder icon again to start fresh.');
+    send({ type: 'error', error: 'Retry failed: no screen stream.' });
+    cleanup();
+    return;
+  }
+  const tracks = [videoTrack];
+  if (audioTrack) tracks.push(audioTrack);
+  mixedStream = new MediaStream(tracks);
+
   startRecorder();
   send({ type: 'recordingRestarted' });
 }

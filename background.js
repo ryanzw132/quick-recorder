@@ -372,6 +372,19 @@ async function handleSW(msg, sender) {
       notify(msg.title || 'Quick Recorder', msg.message || '');
       break;
     }
+    case 'micsChanged': {
+      // Mic device list changed (Bluetooth connect/disconnect, etc).
+      // Update SW state cache and broadcast to the active recording tab so
+      // the bar's mic menu refreshes.
+      state.mics = Array.isArray(msg.mics) ? msg.mics : [];
+      await persist();
+      if (state.tabId) {
+        chrome.tabs.sendMessage(state.tabId, {
+          target: 'content', type: 'micsChanged', mics: state.mics
+        }).catch(() => {});
+      }
+      break;
+    }
     case 'micPermissionMissing': {
       // Offscreen tried mic but it failed. Open the grant page once so the
       // user can grant it without hunting through chrome://settings.
