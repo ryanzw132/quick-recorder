@@ -121,19 +121,52 @@ function attachMicTrackLifecycleHandlers(stream) {
   });
 }
 
-// AudioContext suspends after macOS sleep/wake. Resume it automatically.
+// AudioContext can suspend in a hidden offscreen doc when the captured tab is
+// backgrounded, after macOS sleep/wake, etc. The destination track stays
+// readyState='live' but emits silence — MediaRecorder happily encodes silence,
+// producing a video file with no mic AND no tab audio (both flow through the
+// same destNode). A single statechange handler isn't enough: resume() can
+// reject without a user gesture and the context can be born suspended. We add
+// a watchdog that polls every 500ms while a context exists, retries resume(),
+// and notifies the user if the mixer stays stuck during recording.
+let audioCtxWatchdog = null;
+let audioCtxStuckSince = 0;
+let audioCtxWarned = false;
+function stopAudioCtxWatchdog() {
+  if (audioCtxWatchdog) { clearInterval(audioCtxWatchdog); audioCtxWatchdog = null; }
+  audioCtxStuckSince = 0;
+  audioCtxWarned = false;
+}
 function attachAudioContextRecovery(ctx) {
   if (!ctx) return;
+  stopAudioCtxWatchdog();
   ctx.addEventListener('statechange', () => {
     console.log('[QR offscreen] AudioContext state:', ctx.state);
-    if (ctx.state === 'suspended') {
-      ctx.resume().then(() => {
-        console.log('[QR offscreen] AudioContext resumed automatically');
-      }).catch((e) => {
-        console.warn('[QR offscreen] AudioContext resume failed', e);
-      });
-    }
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
   });
+  audioCtxWatchdog = setInterval(() => {
+    if (!ctx || ctx.state === 'closed') { stopAudioCtxWatchdog(); return; }
+    if (ctx.state === 'running') {
+      audioCtxStuckSince = 0;
+      if (audioCtxWarned) {
+        audioCtxWarned = false;
+        console.log('[QR offscreen] AudioContext recovered to running');
+      }
+      return;
+    }
+    // Not running — keep trying to resume. Single resume() per tick is fine;
+    // Chromium queues at most one pending request internally.
+    ctx.resume().catch(() => {});
+    if (!audioCtxStuckSince) audioCtxStuckSince = Date.now();
+    if (phase === 'recording' && !audioCtxWarned && Date.now() - audioCtxStuckSince > 2000) {
+      audioCtxWarned = true;
+      console.warn('[QR offscreen] AudioContext stuck non-running >2s — recording is silent');
+      notify(
+        'Recording audio is silent',
+        "Chrome paused the audio mixer in the background. Bring this Chrome window to the front, or click ↻ Retry on the bar to recover. Audio is silent until then."
+      );
+    }
+  }, 500);
 }
 
 // Notify content (and SW) when the mic device list changes so the bar menu
@@ -467,12 +500,14 @@ function startAudioMeter() {
       }, 1000);
     };
 
+    // Always meter the final mixer output so a suspended AudioContext (which
+    // makes destNode emit silence while staying readyState='live') can't hide
+    // behind a healthy mic-track meter. The mic meter alone metered the raw
+    // mic; the final meter catches mixer failures that silence everything.
+    audioMeterFinalInterval = startWatcher(mixedStream.getAudioTracks()[0], 'final');
     const micTrack = micStream && micStream.getAudioTracks()[0];
     if (micTrack) {
       audioMeterMicInterval = startWatcher(micTrack, 'mic');
-    } else {
-      // No mic; meter the final track so we still catch silent recordings.
-      audioMeterFinalInterval = startWatcher(mixedStream.getAudioTracks()[0], 'final');
     }
   } catch (e) {
     console.warn('[QR offscreen] audio meter failed', e);
@@ -494,7 +529,13 @@ let pendingTitle = '';
 function stopRecorder() {
   if (recorder && recorder.state !== 'inactive') {
     try { recorder.stop(); } catch {}
+    return;
   }
+  // No active recorder — likely the ~500-2000ms mic re-acquisition window
+  // inside retry(). Mark intent so retry() can honor the stop after the new
+  // recorder is constructed. Without this, stop clicks during retry are
+  // silently dropped and recording resumes against the user's intent.
+  if (retryInFlight) pendingStopDuringRetry = true;
 }
 
 async function start(streamId, tabId) {
@@ -544,6 +585,7 @@ function stopRecording() {
 }
 
 let retryInFlight = false;
+let pendingStopDuringRetry = false;
 async function retry() {
   // Re-acquire the MIC and rebuild the audio graph, then start a fresh
   // recorder. This is the recovery path for a dead/muted mic — without
@@ -554,83 +596,127 @@ async function retry() {
   }
   if (!recorder && phase !== 'recording' && phase !== 'awaiting-begin') return;
   retryInFlight = true;
+  pendingStopDuringRetry = false;
   console.log('[QR offscreen] retry() — re-acquiring mic');
-  const old = recorder;
-  recorder = null; // detach handlers' "save" branch
-  if (old) {
-    old.onstop = null;
-    old.ondataavailable = null;
-    old.onerror = null;
-    try { old.stop(); } catch {}
-  }
-  chunks = [];
-  stopAudioMeter();
-
-  // Tear down the old mic-side of the audio graph (keep tab audio + screen
-  // video — those are still valid).
-  if (micSrc) { try { micSrc.disconnect(); } catch {} }
-  if (micStream) micStream.getTracks().forEach((t) => t.stop());
-  micStream = null;
-  micSrc = null;
-
-  // Re-acquire mic with health verification. May return null if all mics fail.
-  const newMicStream = await acquireMicWithVerification();
-  if (newMicStream) attachMicTrackLifecycleHandlers(newMicStream);
-  micStream = newMicStream;
-
-  // Rebuild audio track. If we have an audioCtx (mixed mode), reattach the
-  // new mic source to the existing destNode. Otherwise rebuild mixedStream
-  // from raw tracks.
-  const sysTracks = screenStream ? screenStream.getAudioTracks() : [];
-  let audioTrack = null;
-  if (audioCtx && destNode && micStream) {
-    if (!micGain) {
-      micGain = audioCtx.createGain();
-      micGain.gain.value = 1.0;
-      micGain.connect(destNode);
+  try {
+    const old = recorder;
+    recorder = null; // detach handlers' "save" branch
+    if (old) {
+      old.ondataavailable = null;
+      old.onerror = null;
+      // Wait for the old recorder's terminal flush before constructing the new
+      // MediaRecorder. Chromium's MP4 muxer shares encoder state via the bound
+      // MediaStreamTrack; constructing a new recorder on the same track before
+      // the old one finishes finalizing pads the next recording's tail with
+      // black frames (~one keyframe interval). 1.5s safety net so a missed
+      // stop event never blocks retry forever.
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (done) return; done = true; resolve(); };
+        old.onstop = finish;
+        setTimeout(finish, 1500);
+        try { old.stop(); } catch { finish(); }
+      });
+      old.onstop = null;
     }
-    micSrc = audioCtx.createMediaStreamSource(micStream);
-    micSrc.connect(micGain);
-    audioTrack = destNode.stream.getAudioTracks()[0];
-  } else if (micStream && sysTracks.length > 0) {
-    // No prior mixer — build one now so both sources end up in the recording.
-    try {
-      audioCtx = new AudioContext();
-      attachAudioContextRecovery(audioCtx);
-      if (audioCtx.state === 'suspended') await audioCtx.resume();
-      destNode = audioCtx.createMediaStreamDestination();
-      micGain = audioCtx.createGain(); micGain.gain.value = 1.0; micGain.connect(destNode);
-      micSrc = audioCtx.createMediaStreamSource(micStream); micSrc.connect(micGain);
-      const sysOnly = new MediaStream([sysTracks[0]]);
-      sysSrc = audioCtx.createMediaStreamSource(sysOnly);
-      sysGain = audioCtx.createGain(); sysGain.gain.value = 1.0;
-      sysSrc.connect(sysGain).connect(destNode);
+    chunks = [];
+    stopAudioMeter();
+
+    // Tear down the old mic-side of the audio graph (keep tab audio + screen
+    // video — those are still valid).
+    if (micSrc) { try { micSrc.disconnect(); } catch {} }
+    if (micStream) micStream.getTracks().forEach((t) => t.stop());
+    micStream = null;
+    micSrc = null;
+
+    // Re-acquire mic with health verification. May return null if all mics fail.
+    const newMicStream = await acquireMicWithVerification();
+    if (newMicStream) attachMicTrackLifecycleHandlers(newMicStream);
+    micStream = newMicStream;
+
+    // Rebuild audio track. If we have an audioCtx (mixed mode), reattach the
+    // new mic source to the existing destNode. Otherwise rebuild mixedStream
+    // from raw tracks.
+    const sysTracks = screenStream ? screenStream.getAudioTracks() : [];
+    let audioTrack = null;
+    if (audioCtx && destNode && micStream) {
+      if (!micGain) {
+        micGain = audioCtx.createGain();
+        micGain.gain.value = 1.0;
+        micGain.connect(destNode);
+      }
+      micSrc = audioCtx.createMediaStreamSource(micStream);
+      micSrc.connect(micGain);
       audioTrack = destNode.stream.getAudioTracks()[0];
-    } catch (e) {
-      console.warn('[QR offscreen] retry: AudioContext rebuild failed, mic-only', e);
+    } else if (micStream && sysTracks.length > 0) {
+      // No prior mixer — build one now so both sources end up in the recording.
+      try {
+        audioCtx = new AudioContext();
+        attachAudioContextRecovery(audioCtx);
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        destNode = audioCtx.createMediaStreamDestination();
+        micGain = audioCtx.createGain(); micGain.gain.value = 1.0; micGain.connect(destNode);
+        micSrc = audioCtx.createMediaStreamSource(micStream); micSrc.connect(micGain);
+        const sysOnly = new MediaStream([sysTracks[0]]);
+        sysSrc = audioCtx.createMediaStreamSource(sysOnly);
+        sysGain = audioCtx.createGain(); sysGain.gain.value = 1.0;
+        sysSrc.connect(sysGain).connect(destNode);
+        audioTrack = destNode.stream.getAudioTracks()[0];
+      } catch (e) {
+        console.warn('[QR offscreen] retry: AudioContext rebuild failed, mic-only', e);
+        // Tear down the partially-built mixer so the watchdog isn't left
+        // attached to a dead context, which could fire spurious "audio
+        // is silent" notifications during the mic-only fallback.
+        try { stopAudioCtxWatchdog(); } catch {}
+        try { audioCtx && audioCtx.close(); } catch {}
+        audioCtx = null;
+        destNode = null;
+        micSrc = sysSrc = micGain = sysGain = null;
+        audioTrack = micStream.getAudioTracks()[0];
+      }
+    } else if (micStream) {
       audioTrack = micStream.getAudioTracks()[0];
+    } else if (sysTracks.length > 0) {
+      audioTrack = sysTracks[0];
     }
-  } else if (micStream) {
-    audioTrack = micStream.getAudioTracks()[0];
-  } else if (sysTracks.length > 0) {
-    audioTrack = sysTracks[0];
-  }
 
-  const videoTrack = screenStream ? screenStream.getVideoTracks()[0] : null;
-  if (!videoTrack) {
-    notify('Retry failed', 'Screen capture was lost. Click the recorder icon again to start fresh.');
-    send({ type: 'error', error: 'Retry failed: no screen stream.' });
-    cleanup();
+    // Clone the screen video track so the new MediaRecorder owns its own track
+    // instance. Reusing the same instance across sequential recorders is the
+    // root cause of the trailing-black-frames bug — the encoder pipeline can't
+    // cleanly finalize when the underlying track is still bound to a prior
+    // recorder. Cloned tracks are stopped via mixedStream in cleanup().
+    const sourceVideoTrack = screenStream ? screenStream.getVideoTracks()[0] : null;
+    const videoTrack = sourceVideoTrack ? sourceVideoTrack.clone() : null;
+    if (!videoTrack) {
+      notify('Retry failed', 'Screen capture was lost. Click the recorder icon again to start fresh.');
+      send({ type: 'error', error: 'Retry failed: no screen stream.' });
+      cleanup();
+      return;
+    }
+    const tracks = [videoTrack];
+    if (audioTrack) tracks.push(audioTrack);
+    mixedStream = new MediaStream(tracks);
+
+    startRecorder();
+    // If a Stop was requested during the await window above (when recorder was
+    // null and stopRecorder() couldn't act), honor it now.
+    if (pendingStopDuringRetry) {
+      pendingStopDuringRetry = false;
+      stopRecorder();
+    }
+    send({ type: 'recordingRestarted' });
+  } catch (e) {
+    console.error('[QR offscreen] retry() threw', e);
+    notify('Retry failed', 'Restart hit an unexpected error. Click the recorder icon again to start fresh.');
+    send({ type: 'error', error: 'Retry failed: ' + (e?.message || e) });
+    try { cleanup(); } catch {}
+  } finally {
+    // ALWAYS release the in-flight gate and stale stop intent — without this,
+    // a thrown error here would silently freeze all future retries and turn
+    // future stop clicks into stuck `pendingStopDuringRetry` writes.
     retryInFlight = false;
-    return;
+    pendingStopDuringRetry = false;
   }
-  const tracks = [videoTrack];
-  if (audioTrack) tracks.push(audioTrack);
-  mixedStream = new MediaStream(tracks);
-
-  startRecorder();
-  send({ type: 'recordingRestarted' });
-  retryInFlight = false;
 }
 
 async function changeMic(deviceId) {
@@ -677,7 +763,12 @@ async function changeMic(deviceId) {
 function cleanup() {
   try { stopRecorder(); } catch {}
   try { stopAudioMeter(); } catch {}
+  try { stopAudioCtxWatchdog(); } catch {}
   recorder = null;
+  // Stop mixedStream tracks first — these may be CLONES of the screen video
+  // track (created in retry() to give each recorder its own track instance).
+  // Stopping the source via screenStream below does not propagate to clones.
+  if (mixedStream) mixedStream.getTracks().forEach((t) => { try { t.stop(); } catch {} });
   if (screenStream) screenStream.getTracks().forEach((t) => t.stop());
   if (micStream) micStream.getTracks().forEach((t) => t.stop());
   screenStream = null;
